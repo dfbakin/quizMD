@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# SQLite (local dev DB)
+backend/quiz.db
+
+# Environment files with secrets
+backend/.env
+backend/.env.docker
+backend/.env.prod
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+pgdata/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Vite
+frontend/.vite/

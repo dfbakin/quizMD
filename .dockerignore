@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+backend/quiz.db
+backend/.env
+frontend/node_modules
+frontend/dist
+.git
+*.md
+!QUIZ_FORMAT.md
