@@ -40,3 +40,5 @@ htmlcov/
 
 # Vite
 frontend/.vite/
+
+group_distribution/

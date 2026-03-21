@@ -60,9 +60,9 @@ export default function TeacherDashboard() {
         {tab === 'assignments' && (
           <AssignmentsTab
             assignments={assignments}
+            setAssignments={setAssignments}
             quizzes={quizzes}
             groups={groups}
-            onReload={reload}
             navigate={navigate}
           />
         )}
@@ -206,8 +206,14 @@ function GroupsTab({ groups, onReload, navigate }: { groups: GroupOut[]; onReloa
 }
 
 function AssignmentsTab({
-  assignments, quizzes, groups, onReload, navigate,
-}: { assignments: AssignmentOut[]; quizzes: QuizSummary[]; groups: GroupOut[]; onReload: () => void; navigate: any }) {
+  assignments, setAssignments, quizzes, groups, navigate,
+}: {
+  assignments: AssignmentOut[];
+  setAssignments: React.Dispatch<React.SetStateAction<AssignmentOut[]>>;
+  quizzes: QuizSummary[];
+  groups: GroupOut[];
+  navigate: any;
+}) {
   const [quizId, setQuizId] = useState<number | ''>('');
   const [groupId, setGroupId] = useState<number | ''>('');
   const [startsAt, setStartsAt] = useState('');
@@ -220,25 +226,25 @@ function AssignmentsTab({
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!quizId || !groupId || !startsAt || !duration) return;
-    await assignmentApi.create({
+    const { data } = await assignmentApi.create({
       quiz_id: Number(quizId),
       group_id: Number(groupId),
       starts_at: new Date(startsAt).toISOString(),
       duration_minutes: duration,
       time_limit_minutes: timeLimit || undefined,
     });
-    onReload();
+    setAssignments((prev) => [data, ...prev]);
   };
 
   const toggleResults = async (id: number, visible: boolean) => {
+    setAssignments((prev) => prev.map((a) => a.id === id ? { ...a, results_visible: visible } : a));
     await assignmentApi.update(id, { results_visible: visible });
-    onReload();
   };
 
   const handleDelete = async (id: number) => {
     if (!confirm('Удалить назначение?')) return;
+    setAssignments((prev) => prev.filter((a) => a.id !== id));
     await assignmentApi.remove(id);
-    onReload();
   };
 
   const copyLink = (a: AssignmentOut) => {
@@ -254,9 +260,9 @@ function AssignmentsTab({
   };
 
   const saveTL = async (id: number) => {
-    await assignmentApi.update(id, { time_limit_minutes: editTLValue });
+    setAssignments((prev) => prev.map((a) => a.id === id ? { ...a, time_limit_minutes: editTLValue } : a));
     setEditingTL(null);
-    onReload();
+    await assignmentApi.update(id, { time_limit_minutes: editTLValue });
   };
 
   const inp = "border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded-lg px-3 py-2 text-sm";

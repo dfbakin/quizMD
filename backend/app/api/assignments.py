@@ -80,7 +80,7 @@ def list_assignments(
         db.query(Assignment)
         .join(Quiz)
         .filter(Quiz.teacher_id == teacher.id)
-        .order_by(Assignment.starts_at.desc())
+        .order_by(Assignment.starts_at.desc(), Assignment.id.desc())
         .all()
     )
     return [_assignment_to_out(a) for a in assignments]
