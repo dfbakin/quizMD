@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { studentApi } from '../api/endpoints';
 import type { AttemptStart, AnswerSave } from '../types/quiz';
@@ -6,6 +6,21 @@ import QuizQuestion from '../components/QuizQuestion';
 import Timer from '../components/Timer';
 import { useAutoSave } from '../hooks/useAutoSave';
 import ThemeToggle from '../components/ThemeToggle';
+
+function getStatusCode(err: unknown): number | undefined {
+  if (typeof err === 'object' && err !== null && 'response' in err) {
+    return (err as { response?: { status?: number } }).response?.status;
+  }
+  return undefined;
+}
+
+function getErrorDetail(err: unknown): string | undefined {
+  if (typeof err === 'object' && err !== null && 'response' in err) {
+    const detail = (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
+    if (typeof detail === 'string') return detail;
+  }
+  return undefined;
+}
 
 export default function QuizTake() {
   const { assignmentId } = useParams<{ assignmentId: string }>();
@@ -15,6 +30,7 @@ export default function QuizTake() {
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState('');
+  const invalidatedRef = useRef(false);
 
   useEffect(() => {
     if (!assignmentId) return;
@@ -22,7 +38,7 @@ export default function QuizTake() {
       const data = r.data;
       setAttempt(data);
       const savedMap = new Map(
-        (data.saved_answers || []).map((a: any) => [a.question_id, a]),
+        (data.saved_answers || []).map((a) => [a.question_id, a]),
       );
       setAnswers(data.questions.map((q) => {
         const saved = savedMap.get(q.id);
@@ -35,16 +51,23 @@ export default function QuizTake() {
         }
         return { question_id: q.id };
       }));
-    }).catch((err) => {
-      if (err.response?.status === 409) {
+    }).catch((err: unknown) => {
+      if (getStatusCode(err) === 409) {
         setSubmitted(true);
       } else {
-        setError(err.response?.data?.detail || 'Не удалось начать тест');
+        setError(getErrorDetail(err) || 'Не удалось начать тест');
       }
     });
   }, [assignmentId]);
 
-  useAutoSave(attempt?.attempt_id ?? null, attempt?.session_token ?? null, answers);
+  const handleAttemptInvalidated = useCallback(() => {
+    if (invalidatedRef.current) return;
+    invalidatedRef.current = true;
+    window.alert('Попытка была сброшена преподавателем. Вы возвращены к списку тестов.');
+    navigate('/student', { replace: true });
+  }, [navigate]);
+
+  useAutoSave(attempt?.attempt_id ?? null, attempt?.session_token ?? null, answers, 60000, handleAttemptInvalidated);
 
   const updateAnswer = useCallback((updated: AnswerSave) => {
     setAnswers((prev) => prev.map((a) => (a.question_id === updated.question_id ? updated : a)));
@@ -56,15 +79,17 @@ export default function QuizTake() {
     try {
       await studentApi.submitAttempt(attempt.attempt_id, answers, attempt.session_token);
       setSubmitted(true);
-    } catch (err: any) {
-      if (err.response?.status === 409) {
+    } catch (err: unknown) {
+      if (getStatusCode(err) === 409) {
         setSubmitted(true);
+      } else if (getStatusCode(err) === 404) {
+        handleAttemptInvalidated();
       } else {
         setError('Ошибка при отправке');
       }
     }
     setSubmitting(false);
-  }, [attempt, answers, submitting, submitted]);
+  }, [attempt, answers, submitting, submitted, handleAttemptInvalidated]);
 
   const handleExpire = useCallback(() => {
     handleSubmit();
@@ -117,8 +142,8 @@ export default function QuizTake() {
           <div className="flex items-center gap-4">
             {attempt.time_limit_minutes && (
               <Timer
-                startedAt={attempt.started_at}
-                timeLimitMinutes={attempt.time_limit_minutes}
+                deadlineAt={attempt.deadline_at}
+                serverNow={attempt.server_now}
                 onExpire={handleExpire}
               />
             )}

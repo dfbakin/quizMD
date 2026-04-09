@@ -39,6 +39,24 @@ def _ensure_naive(d: dt.datetime) -> dt.datetime:
     return d.replace(tzinfo=None) if d.tzinfo else d
 
 
+def _assignment_time_limit_minutes(assignment: Assignment) -> int | None:
+    return assignment.time_limit_minutes or assignment.quiz.time_limit_minutes
+
+
+def _attempt_deadline(attempt: Attempt) -> dt.datetime:
+    """Hybrid rule: min(attempt started + time limit, assignment end)."""
+    assignment_end = _ensure_naive(attempt.assignment.ends_at)
+    tlm = _assignment_time_limit_minutes(attempt.assignment)
+    if tlm and tlm > 0:
+        by_attempt_limit = _ensure_naive(attempt.started_at) + dt.timedelta(minutes=tlm)
+        return min(by_attempt_limit, assignment_end)
+    return assignment_end
+
+
+def _is_attempt_expired(attempt: Attempt, now: dt.datetime) -> bool:
+    return now > _attempt_deadline(attempt)
+
+
 @router.get("/api/my/assignments", response_model=list[StudentAssignmentOut])
 def list_my_assignments(
     student: Student = Depends(get_current_student),
@@ -58,11 +76,10 @@ def list_my_assignments(
             .filter(Attempt.assignment_id == a.id, Attempt.student_id == student.id)
             .first()
         )
-        tlm = a.time_limit_minutes or a.quiz.time_limit_minutes
+        tlm = _assignment_time_limit_minutes(a)
         attempt_expired = False
-        if attempt and not attempt.submitted_at and tlm:
-            deadline = _ensure_naive(attempt.started_at) + dt.timedelta(minutes=tlm)
-            attempt_expired = now > deadline
+        if attempt and not attempt.submitted_at:
+            attempt_expired = _is_attempt_expired(attempt, now)
 
         if now < _ensure_naive(a.starts_at):
             s = "upcoming"
@@ -113,14 +130,12 @@ def start_attempt(
     if existing and existing.submitted_at:
         raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
 
-    tlm = assignment.time_limit_minutes or assignment.quiz.time_limit_minutes
+    tlm = _assignment_time_limit_minutes(assignment)
 
     if existing:
-        if tlm:
-            deadline = _ensure_naive(existing.started_at) + dt.timedelta(minutes=tlm)
-            if now > deadline:
-                _auto_grade_expired(existing, db)
-                raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
+        if _is_attempt_expired(existing, now):
+            _auto_grade_expired(existing, db, now=now)
+            raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
 
         new_token = uuid.uuid4().hex
         existing.session_token = new_token
@@ -142,6 +157,8 @@ def start_attempt(
             questions=questions,
             time_limit_minutes=tlm,
             started_at=existing.started_at,
+            deadline_at=_attempt_deadline(existing),
+            server_now=now,
             saved_answers=saved,
         )
 
@@ -164,14 +181,21 @@ def start_attempt(
         questions=questions,
         time_limit_minutes=tlm,
         started_at=attempt.started_at,
+        deadline_at=_attempt_deadline(attempt),
+        server_now=now,
         saved_answers=[],
     )
 
 
-def _auto_grade_expired(attempt: Attempt, db: Session) -> None:
+def _auto_grade_expired(attempt: Attempt, db: Session, *, now: dt.datetime | None = None) -> None:
     """Grade saved answers and mark as submitted for expired attempts."""
     if attempt.submitted_at:
         return
+    now = now or _utcnow()
+    deadline = _attempt_deadline(attempt)
+    if now <= deadline:
+        return
+
     for answer in attempt.answers:
         question = db.get(Question, answer.question_id)
         if question is None:
@@ -189,9 +213,6 @@ def _auto_grade_expired(attempt: Attempt, db: Session) -> None:
         answer.points_awarded = result.points_awarded
 
     total = sum(a.points_awarded for a in attempt.answers)
-    deadline = _ensure_naive(attempt.started_at) + dt.timedelta(
-        minutes=attempt.assignment.time_limit_minutes or attempt.assignment.quiz.time_limit_minutes or 0,
-    )
     attempt.submitted_at = deadline
     attempt.score = total
     db.commit()
@@ -244,6 +265,10 @@ def save_answers(
     _verify_session_token(attempt, x_session_token)
     if attempt.submitted_at:
         raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
+    now = _utcnow()
+    if _is_attempt_expired(attempt, now):
+        _auto_grade_expired(attempt, db, now=now)
+        raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
 
     _upsert_answers(attempt, body.answers, db, grade=False)
     return {"status": "saved"}
@@ -264,24 +289,16 @@ def submit_attempt(
     if attempt.submitted_at:
         raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
 
-    assignment = attempt.assignment
     now = _utcnow()
+    if _is_attempt_expired(attempt, now):
+        _auto_grade_expired(attempt, db, now=now)
+        raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
 
-    tlm = assignment.time_limit_minutes or assignment.quiz.time_limit_minutes
-    late = False
-    if tlm:
-        grace_seconds = 30
-        deadline = _ensure_naive(attempt.started_at) + dt.timedelta(minutes=tlm, seconds=grace_seconds)
-        late = now > deadline
-
-    if late:
-        _auto_grade_expired(attempt, db)
-    else:
-        _upsert_answers(attempt, body.answers, db, grade=True)
-        db.refresh(attempt)
-        attempt.submitted_at = now
-        attempt.score = sum(a.points_awarded for a in attempt.answers)
-        db.commit()
+    _upsert_answers(attempt, body.answers, db, grade=True)
+    db.refresh(attempt)
+    attempt.submitted_at = now
+    attempt.score = sum(a.points_awarded for a in attempt.answers)
+    db.commit()
 
     return {"status": "submitted", "score": attempt.score}
 

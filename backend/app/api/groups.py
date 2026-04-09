@@ -8,7 +8,7 @@ from app.models import Teacher, Group, Student
 from app.api.deps import get_current_teacher
 from app.auth.passwords import hash_password
 from app.schemas.schemas import (
-    GroupCreate, GroupOut, StudentCreate, StudentBulkCreate, StudentOut,
+    GroupCreate, GroupOut, StudentCreate, StudentBulkCreate, StudentOut, StudentUpdate,
 )
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
@@ -88,6 +88,38 @@ def delete_student(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
     db.delete(student)
     db.commit()
+
+
+@router.patch("/{group_id}/students/{student_id}", response_model=StudentOut)
+def update_student(
+    group_id: int,
+    student_id: int,
+    body: StudentUpdate,
+    teacher: Teacher = Depends(get_current_teacher),
+    db: Session = Depends(get_db),
+):
+    group = db.get(Group, group_id)
+    if group is None or group.teacher_id != teacher.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
+    student = db.get(Student, student_id)
+    if student is None or student.group_id != group_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+
+    if body.display_name is None and body.password is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "No changes provided")
+    if body.display_name is not None:
+        name = body.display_name.strip()
+        if not name:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Display name cannot be empty")
+        student.display_name = name
+    if body.password is not None:
+        if not body.password:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Password cannot be empty")
+        student.password_hash = hash_password(body.password)
+
+    db.commit()
+    db.refresh(student)
+    return StudentOut.model_validate(student)
 
 
 @router.post("/{group_id}/students", response_model=list[StudentOut], status_code=201)

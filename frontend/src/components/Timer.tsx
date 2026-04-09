@@ -1,31 +1,37 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 interface TimerProps {
-  startedAt: string;
-  timeLimitMinutes: number;
+  deadlineAt: string;
+  serverNow: string;
   onExpire: () => void;
 }
 
-export default function Timer({ startedAt, timeLimitMinutes, onExpire }: TimerProps) {
-  const calcRemaining = useCallback(() => {
-    const start = new Date(startedAt).getTime();
-    const end = start + timeLimitMinutes * 60 * 1000;
-    return Math.max(0, Math.floor((end - Date.now()) / 1000));
-  }, [startedAt, timeLimitMinutes]);
+export default function Timer({ deadlineAt, serverNow, onExpire }: TimerProps) {
+  const offsetMsRef = useRef(0);
+  const didExpireRef = useRef(false);
 
-  const [remaining, setRemaining] = useState(calcRemaining);
+  const calcRemaining = useCallback(() => {
+    const end = new Date(deadlineAt).getTime();
+    return Math.max(0, Math.floor((end - (Date.now() + offsetMsRef.current)) / 1000));
+  }, [deadlineAt]);
+
+  const [remaining, setRemaining] = useState(0);
 
   useEffect(() => {
-    const interval = setInterval(() => {
+    offsetMsRef.current = new Date(serverNow).getTime() - Date.now();
+    didExpireRef.current = false;
+    const tick = () => {
       const r = calcRemaining();
       setRemaining(r);
-      if (r <= 0) {
-        clearInterval(interval);
+      if (r <= 0 && !didExpireRef.current) {
+        didExpireRef.current = true;
         onExpire();
       }
-    }, 1000);
+    };
+    tick();
+    const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [calcRemaining, onExpire]);
+  }, [calcRemaining, onExpire, serverNow]);
 
   const mins = Math.floor(remaining / 60);
   const secs = remaining % 60;

@@ -4,10 +4,26 @@ import { assignmentApi } from '../api/endpoints';
 import type { AssignmentResultsSummary } from '../types/quiz';
 import ThemeToggle from '../components/ThemeToggle';
 
+function getErrorDetail(err: unknown): string | undefined {
+  if (typeof err === 'object' && err !== null && 'response' in err) {
+    const detail = (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
+    if (typeof detail === 'string') return detail;
+  }
+  return undefined;
+}
+
+function extractFilename(disposition: string | undefined, fallback: string): string {
+  if (!disposition) return fallback;
+  const match = disposition.match(/filename="?([^"]+)"?/i);
+  return match?.[1] ?? fallback;
+}
+
 export default function AssignmentResults() {
   const { assignmentId } = useParams<{ assignmentId: string }>();
   const navigate = useNavigate();
   const [data, setData] = useState<AssignmentResultsSummary | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
 
   useEffect(() => {
     if (!assignmentId) return;
@@ -20,6 +36,31 @@ export default function AssignmentResults() {
 
   const sorted = [...data.results].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 
+  const handleExport = async () => {
+    if (!assignmentId || exporting) return;
+    setExportError('');
+    setExporting(true);
+    try {
+      const resp = await assignmentApi.exportResultsCsv(Number(assignmentId));
+      const fallback = `assignment_${assignmentId}_results.csv`;
+      const contentDisposition = resp.headers['content-disposition'] as string | undefined;
+      const filename = extractFilename(contentDisposition, fallback);
+      const blob = new Blob([resp.data], { type: 'text/csv;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err: unknown) {
+      setExportError(getErrorDetail(err) || 'Не удалось экспортировать CSV');
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950">
       <header className="bg-white dark:bg-gray-900 shadow-sm border-b border-gray-200 dark:border-gray-700">
@@ -29,12 +70,24 @@ export default function AssignmentResults() {
             <p className="text-sm text-gray-500 dark:text-gray-400">{data.group_name} · макс. {data.max_score} баллов</p>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              onClick={handleExport}
+              disabled={exporting}
+              className="text-sm bg-indigo-600 text-white px-3 py-1.5 rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition"
+            >
+              {exporting ? 'Экспорт...' : 'Экспорт CSV'}
+            </button>
             <ThemeToggle />
             <button onClick={() => navigate('/teacher')} className="text-sm text-gray-500 dark:text-gray-400 hover:text-blue-600 transition">Назад</button>
           </div>
         </div>
       </header>
       <main className="max-w-4xl mx-auto px-4 py-6">
+        {exportError && (
+          <div className="mb-4 p-3 rounded-lg bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 text-sm">
+            {exportError}
+          </div>
+        )}
         <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
           <table className="w-full text-sm">
             <thead className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-950">

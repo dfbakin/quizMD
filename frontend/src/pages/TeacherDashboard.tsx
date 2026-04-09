@@ -1,10 +1,18 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, type NavigateFunction } from 'react-router-dom';
 import { quizApi, groupApi, assignmentApi } from '../api/endpoints';
 import type { QuizSummary, GroupOut, AssignmentOut } from '../types/quiz';
 import { useAuth } from '../hooks/useAuth';
 import SearchSelect from '../components/SearchSelect';
 import ThemeToggle from '../components/ThemeToggle';
+
+function getApiErrorDetail(err: unknown): string | undefined {
+  if (typeof err === 'object' && err !== null && 'response' in err) {
+    const detail = (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
+    if (typeof detail === 'string') return detail;
+  }
+  return undefined;
+}
 
 export default function TeacherDashboard() {
   const { user, logout } = useAuth();
@@ -71,7 +79,7 @@ export default function TeacherDashboard() {
   );
 }
 
-function QuizzesTab({ quizzes, onReload, navigate }: { quizzes: QuizSummary[]; onReload: () => void; navigate: any }) {
+function QuizzesTab({ quizzes, onReload, navigate }: { quizzes: QuizSummary[]; onReload: () => void; navigate: NavigateFunction }) {
   const handleImport = async () => {
     const input = document.createElement('input');
     input.type = 'file';
@@ -82,8 +90,8 @@ function QuizzesTab({ quizzes, onReload, navigate }: { quizzes: QuizSummary[]; o
       try {
         await quizApi.importFile(file);
         onReload();
-      } catch (err: any) {
-        alert(err.response?.data?.detail || 'Ошибка импорта');
+      } catch (err: unknown) {
+        alert(getApiErrorDetail(err) || 'Ошибка импорта');
       }
     };
     input.click();
@@ -134,7 +142,7 @@ function QuizzesTab({ quizzes, onReload, navigate }: { quizzes: QuizSummary[]; o
   );
 }
 
-function GroupsTab({ groups, onReload, navigate }: { groups: GroupOut[]; onReload: () => void; navigate: any }) {
+function GroupsTab({ groups, onReload, navigate }: { groups: GroupOut[]; onReload: () => void; navigate: NavigateFunction }) {
   const [newName, setNewName] = useState('');
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
@@ -148,8 +156,8 @@ function GroupsTab({ groups, onReload, navigate }: { groups: GroupOut[]; onReloa
       await groupApi.create(newName.trim());
       setNewName('');
       onReload();
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка при создании группы');
+    } catch (err: unknown) {
+      setError(getApiErrorDetail(err) || 'Ошибка при создании группы');
     }
     setCreating(false);
   };
@@ -159,8 +167,8 @@ function GroupsTab({ groups, onReload, navigate }: { groups: GroupOut[]; onReloa
     try {
       await groupApi.remove(id);
       onReload();
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка при удалении');
+    } catch (err: unknown) {
+      setError(getApiErrorDetail(err) || 'Ошибка при удалении');
     }
   };
 
@@ -212,26 +220,42 @@ function AssignmentsTab({
   setAssignments: React.Dispatch<React.SetStateAction<AssignmentOut[]>>;
   quizzes: QuizSummary[];
   groups: GroupOut[];
-  navigate: any;
+  navigate: NavigateFunction;
 }) {
   const [quizId, setQuizId] = useState<number | ''>('');
   const [groupId, setGroupId] = useState<number | ''>('');
   const [startsAt, setStartsAt] = useState('');
-  const [duration, setDuration] = useState(45);
-  const [timeLimit, setTimeLimit] = useState(30);
+  const [durationInput, setDurationInput] = useState('45');
+  const [timeLimitInput, setTimeLimitInput] = useState('30');
+  const [formError, setFormError] = useState('');
   const [copied, setCopied] = useState<number | null>(null);
   const [editingTL, setEditingTL] = useState<number | null>(null);
-  const [editTLValue, setEditTLValue] = useState(0);
+  const [editTLValue, setEditTLValue] = useState('');
+  const [editingStart, setEditingStart] = useState<number | null>(null);
+  const [editStartValue, setEditStartValue] = useState('');
+
+  const parsePositiveInt = (value: string): number | null => {
+    if (!/^\d+$/.test(value.trim())) return null;
+    const n = Number(value);
+    if (!Number.isInteger(n) || n <= 0) return null;
+    return n;
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!quizId || !groupId || !startsAt || !duration) return;
+    setFormError('');
+    const duration = parsePositiveInt(durationInput);
+    const timeLimit = parsePositiveInt(timeLimitInput);
+    if (!quizId || !groupId || !startsAt || !duration || !timeLimit) {
+      setFormError('Введите положительное целое число для длительности и таймера.');
+      return;
+    }
     const { data } = await assignmentApi.create({
       quiz_id: Number(quizId),
       group_id: Number(groupId),
       starts_at: new Date(startsAt).toISOString(),
       duration_minutes: duration,
-      time_limit_minutes: timeLimit || undefined,
+      time_limit_minutes: timeLimit,
     });
     setAssignments((prev) => [data, ...prev]);
   };
@@ -256,13 +280,39 @@ function AssignmentsTab({
 
   const startEditTL = (a: AssignmentOut) => {
     setEditingTL(a.id);
-    setEditTLValue(a.time_limit_minutes ?? 30);
+    setEditTLValue(String(a.time_limit_minutes ?? ''));
   };
 
   const saveTL = async (id: number) => {
-    setAssignments((prev) => prev.map((a) => a.id === id ? { ...a, time_limit_minutes: editTLValue } : a));
+    const parsed = parsePositiveInt(editTLValue);
+    if (!parsed) {
+      alert('Таймер должен быть положительным целым числом.');
+      return;
+    }
+    setAssignments((prev) => prev.map((a) => a.id === id ? { ...a, time_limit_minutes: parsed } : a));
     setEditingTL(null);
-    await assignmentApi.update(id, { time_limit_minutes: editTLValue });
+    await assignmentApi.update(id, { time_limit_minutes: parsed });
+  };
+
+  const toDateTimeLocal = (iso: string) => {
+    const d = new Date(iso);
+    const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 16);
+  };
+
+  const startEditStart = (a: AssignmentOut) => {
+    setEditingStart(a.id);
+    setEditStartValue(toDateTimeLocal(a.starts_at));
+  };
+
+  const saveStart = async (id: number) => {
+    if (!editStartValue) return;
+    if (!confirm('Изменение времени старта удалит все незавершённые попытки по этому назначению. Продолжить?')) {
+      return;
+    }
+    const { data } = await assignmentApi.update(id, { starts_at: new Date(editStartValue).toISOString() });
+    setAssignments((prev) => prev.map((a) => a.id === id ? data : a));
+    setEditingStart(null);
   };
 
   const inp = "border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded-lg px-3 py-2 text-sm";
@@ -286,14 +336,31 @@ function AssignmentsTab({
         <input type="datetime-local" value={startsAt} onChange={(e) => setStartsAt(e.target.value)} className={inp} />
         <div className="flex items-center gap-2">
           <span className="text-xs text-gray-500 dark:text-gray-400">Доступен</span>
-          <input type="number" min={1} value={duration} onChange={(e) => setDuration(Number(e.target.value))} className={`w-20 ${inp}`} />
+          <input
+            type="text"
+            inputMode="numeric"
+            value={durationInput}
+            onChange={(e) => setDurationInput(e.target.value)}
+            className={`w-20 ${inp}`}
+            placeholder="45"
+          />
           <span className="text-xs text-gray-500 dark:text-gray-400">мин</span>
         </div>
         <div className="flex items-center gap-2 col-span-2">
           <span className="text-xs text-gray-500 dark:text-gray-400">Время на попытку</span>
-          <input type="number" min={1} value={timeLimit} onChange={(e) => setTimeLimit(Number(e.target.value))} className={`w-20 ${inp}`} />
+          <input
+            type="text"
+            inputMode="numeric"
+            value={timeLimitInput}
+            onChange={(e) => setTimeLimitInput(e.target.value)}
+            className={`w-20 ${inp}`}
+            placeholder="30"
+          />
           <span className="text-xs text-gray-500 dark:text-gray-400">мин (таймер у ученика)</span>
         </div>
+        {formError && (
+          <div className="col-span-2 text-xs text-red-600 dark:text-red-400">{formError}</div>
+        )}
         <button type="submit" className="col-span-2 bg-blue-600 text-white py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition">
           Назначить
         </button>
@@ -309,14 +376,36 @@ function AssignmentsTab({
                   {a.group_name} · доступен {a.duration_minutes} мин · {new Date(a.starts_at).toLocaleString('ru')}
                 </p>
                 <div className="flex items-center gap-2 mt-1">
+                  {editingStart === a.id ? (
+                    <>
+                      <span className="text-xs text-gray-500 dark:text-gray-400">Старт:</span>
+                      <input
+                        type="datetime-local"
+                        value={editStartValue}
+                        onChange={(e) => setEditStartValue(e.target.value)}
+                        className="border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded px-2 py-0.5 text-xs"
+                      />
+                      <button onClick={() => saveStart(a.id)} className="text-xs text-green-600 dark:text-green-400 hover:underline">Сохранить</button>
+                      <button onClick={() => setEditingStart(null)} className="text-xs text-gray-500 dark:text-gray-400 hover:underline">Отмена</button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-xs text-gray-500 dark:text-gray-400">
+                        Старт: {new Date(a.starts_at).toLocaleString('ru')}
+                      </span>
+                      <button onClick={() => startEditStart(a)} className="text-xs text-blue-600 dark:text-blue-400 hover:underline">Изменить</button>
+                    </>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 mt-1">
                   {editingTL === a.id ? (
                     <>
                       <span className="text-xs text-gray-500 dark:text-gray-400">Таймер:</span>
                       <input
-                        type="number"
-                        min={1}
+                        type="text"
+                        inputMode="numeric"
                         value={editTLValue}
-                        onChange={(e) => setEditTLValue(Number(e.target.value))}
+                        onChange={(e) => setEditTLValue(e.target.value)}
                         className="w-16 border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded px-2 py-0.5 text-xs"
                       />
                       <span className="text-xs text-gray-500 dark:text-gray-400">мин</span>

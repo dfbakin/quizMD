@@ -1,0 +1,2 @@
+﻿student_id,student_login,attempt_id,status,score,max_score,correct_answers_count,total_questions,submitted_at,q1_correct,q2_correct,q3_correct,q4_correct,q5_correct,q6_correct
+1,student01,1,submitted,0,6,0,6,2026-04-09T15:30:19.943984Z,0,0,0,0,0,0

@@ -12,7 +12,7 @@ import AssignmentResults from './pages/AssignmentResults';
 import TeacherAttemptDetail from './pages/TeacherAttemptDetail';
 import QuizRedirect from './pages/QuizRedirect';
 
-function ProtectedRoute({ children, requiredRole }: { children: React.ReactNode; requiredRole?: string }) {
+export function ProtectedRoute({ children, requiredRole }: { children: React.ReactNode; requiredRole?: string }) {
   const { user } = useAuth();
   if (!user) return <Navigate to="/login" />;
   if (requiredRole && user.role !== requiredRole) {

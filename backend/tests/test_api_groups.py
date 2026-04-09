@@ -73,3 +73,58 @@ class TestStudents:
             headers=headers,
         )
         assert resp.status_code == 409
+
+    def test_update_student_display_name_and_password(self, db: Session, app_client):
+        headers = _teacher_headers(app_client, db)
+        group = app_client.post("/api/groups", json={"name": "11А"}, headers=headers).json()
+        created = app_client.post(
+            f"/api/groups/{group['id']}/students",
+            json={"students": [{"username": "s1", "password": "oldpass", "display_name": "Old Name"}]},
+            headers=headers,
+        ).json()[0]
+
+        resp = app_client.patch(
+            f"/api/groups/{group['id']}/students/{created['id']}",
+            json={"display_name": "New Name", "password": "newpass"},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["display_name"] == "New Name"
+
+        old_login = app_client.post("/api/auth/login", json={"username": "s1", "password": "oldpass"})
+        assert old_login.status_code == 401
+        new_login = app_client.post("/api/auth/login", json={"username": "s1", "password": "newpass"})
+        assert new_login.status_code == 200
+
+    def test_update_student_in_other_group_rejected(self, db: Session, app_client):
+        headers = _teacher_headers(app_client, db)
+        g1 = app_client.post("/api/groups", json={"name": "11А"}, headers=headers).json()
+        g2 = app_client.post("/api/groups", json={"name": "11Б"}, headers=headers).json()
+        created = app_client.post(
+            f"/api/groups/{g1['id']}/students",
+            json={"students": [{"username": "s1", "password": "pass", "display_name": "S1"}]},
+            headers=headers,
+        ).json()[0]
+
+        resp = app_client.patch(
+            f"/api/groups/{g2['id']}/students/{created['id']}",
+            json={"display_name": "Nope"},
+            headers=headers,
+        )
+        assert resp.status_code == 404
+
+    def test_update_student_without_changes_rejected(self, db: Session, app_client):
+        headers = _teacher_headers(app_client, db)
+        group = app_client.post("/api/groups", json={"name": "11А"}, headers=headers).json()
+        created = app_client.post(
+            f"/api/groups/{group['id']}/students",
+            json={"students": [{"username": "s1", "password": "pass", "display_name": "S1"}]},
+            headers=headers,
+        ).json()[0]
+
+        resp = app_client.patch(
+            f"/api/groups/{group['id']}/students/{created['id']}",
+            json={},
+            headers=headers,
+        )
+        assert resp.status_code == 422

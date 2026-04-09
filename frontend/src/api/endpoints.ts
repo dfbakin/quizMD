@@ -34,6 +34,8 @@ export const groupApi = {
   students: (gid: number) => api.get<StudentOut[]>(`/groups/${gid}/students`),
   addStudents: (gid: number, students: { username: string; password: string; display_name: string }[]) =>
     api.post<StudentOut[]>(`/groups/${gid}/students`, { students }),
+  updateStudent: (gid: number, sid: number, data: { display_name?: string; password?: string }) =>
+    api.patch<StudentOut>(`/groups/${gid}/students/${sid}`, data),
   removeStudent: (gid: number, sid: number) => api.delete(`/groups/${gid}/students/${sid}`),
 };
 
@@ -47,6 +49,8 @@ export const assignmentApi = {
     api.patch<AssignmentOut>(`/assignments/${id}`, data),
   remove: (id: number) => api.delete(`/assignments/${id}`),
   results: (id: number) => api.get<AssignmentResultsSummary>(`/assignments/${id}/results`),
+  exportResultsCsv: (id: number) =>
+    api.get<Blob>(`/assignments/${id}/results.csv`, { responseType: 'blob' }),
   attemptDetail: (assignmentId: number, attemptId: number) =>
     api.get<AttemptResult>(`/assignments/${assignmentId}/attempts/${attemptId}`),
 };

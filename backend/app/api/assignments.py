@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import io
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -32,6 +35,13 @@ def _assignment_to_out(a: Assignment) -> AssignmentOut:
         group_name=a.group.name,
         share_code=a.share_code,
     )
+
+
+def _fmt_dt_csv(value: dt.datetime | None) -> str:
+    if value is None:
+        return ""
+    v = value.replace(tzinfo=None) if value.tzinfo else value
+    return f"{v.isoformat()}Z"
 
 
 @router.post("", response_model=AssignmentOut, status_code=201)
@@ -97,15 +107,31 @@ def update_assignment(
     if assignment is None or assignment.quiz.teacher_id != teacher.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
 
+    starts_at_changed = False
     if body.results_visible is not None:
         assignment.results_visible = body.results_visible
     if body.starts_at is not None:
-        assignment.starts_at = body.starts_at
+        new_starts = body.starts_at.replace(tzinfo=None) if body.starts_at.tzinfo else body.starts_at
+        starts_at_changed = new_starts != assignment.starts_at
+        assignment.starts_at = new_starts
     if body.duration_minutes is not None:
         assignment.duration_minutes = body.duration_minutes
-        assignment.ends_at = assignment.starts_at + dt.timedelta(minutes=body.duration_minutes)
+        assignment.ends_at = assignment.starts_at + dt.timedelta(minutes=assignment.duration_minutes)
+    elif starts_at_changed:
+        # Keep schedule consistency when starts_at changes by itself.
+        assignment.ends_at = assignment.starts_at + dt.timedelta(minutes=assignment.duration_minutes)
     if body.time_limit_minutes is not None:
         assignment.time_limit_minutes = body.time_limit_minutes
+
+    if starts_at_changed:
+        # Teacher explicitly requested that changing starts_at aborts open attempts.
+        unfinished_attempts = (
+            db.query(Attempt)
+            .filter(Attempt.assignment_id == assignment.id, Attempt.submitted_at.is_(None))
+            .all()
+        )
+        for att in unfinished_attempts:
+            db.delete(att)
 
     db.commit()
     db.refresh(assignment)
@@ -224,4 +250,78 @@ def get_attempt_detail_teacher(
         max_score=max_score,
         submitted_at=attempt.submitted_at,
         questions=question_details,
+    )
+
+
+@router.get("/{assignment_id}/results.csv")
+def export_assignment_results_csv(
+    assignment_id: int,
+    teacher: Teacher = Depends(get_current_teacher),
+    db: Session = Depends(get_db),
+):
+    assignment = db.get(Assignment, assignment_id)
+    if assignment is None or assignment.quiz.teacher_id != teacher.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
+
+    attempts = db.query(Attempt).filter(Attempt.assignment_id == assignment_id).all()
+    from app.api.students import _auto_grade_expired
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    for att in attempts:
+        if not att.submitted_at:
+            _auto_grade_expired(att, db, now=now)
+
+    # Re-read attempts after possible auto-grading mutations.
+    attempts = db.query(Attempt).filter(Attempt.assignment_id == assignment_id).all()
+    questions = list(assignment.quiz.questions)
+    max_score = sum(q.points for q in questions)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    header = [
+        "student_id",
+        "student_login",
+        "attempt_id",
+        "status",
+        "score",
+        "max_score",
+        "correct_answers_count",
+        "total_questions",
+        "submitted_at",
+    ] + [f"q{idx + 1}_correct" for idx, _ in enumerate(questions)]
+    writer.writerow(header)
+
+    for att in attempts:
+        answers_map = {a.question_id: a for a in att.answers}
+        per_question: list[str] = []
+        correct_answers_count = 0
+        for q in questions:
+            ans = answers_map.get(q.id)
+            if ans is None or ans.is_correct is None:
+                per_question.append("")
+                continue
+            if ans.is_correct:
+                correct_answers_count += 1
+                per_question.append("1")
+            else:
+                per_question.append("0")
+
+        row = [
+            att.student_id,
+            att.student.username,
+            att.id,
+            "submitted" if att.submitted_at else "in_progress",
+            "" if att.score is None else f"{att.score:g}",
+            max_score,
+            correct_answers_count,
+            len(questions),
+            _fmt_dt_csv(att.submitted_at),
+        ] + per_question
+        writer.writerow(row)
+
+    filename = f'assignment_{assignment_id}_results.csv'
+    csv_content = "\ufeff" + output.getvalue()
+    return Response(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

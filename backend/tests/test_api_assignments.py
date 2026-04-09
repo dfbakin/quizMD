@@ -1,5 +1,6 @@
 """Tests for assignment CRUD API."""
 
+import csv
 import io
 import datetime as dt
 import pytest
@@ -20,6 +21,10 @@ def _setup(app_client, db: Session):
         "/api/quizzes/import", files={"file": ("q.md", file, "text/markdown")}, headers=headers,
     ).json()
     return headers, quiz["id"], group["id"]
+
+
+def _parse_utc(s: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
 class TestAssignmentCRUD:
@@ -123,3 +128,107 @@ class TestAssignmentCRUD:
         }, headers=headers)
         assert resp.status_code == 201
         assert resp.json()["time_limit_minutes"] == 20
+
+    def test_change_start_time_aborts_unfinished_attempts_and_recomputes_end(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        app_client.post(
+            f"/api/groups/{group_id}/students",
+            json={"students": [{"username": "s1", "password": "pass", "display_name": "S1"}]},
+            headers=headers,
+        )
+        s_login = app_client.post("/api/auth/login", json={"username": "s1", "password": "pass"})
+        s_headers = {"Authorization": f"Bearer {s_login.json()['access_token']}"}
+
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": (now - dt.timedelta(minutes=1)).isoformat(),
+            "duration_minutes": 30,
+        }, headers=headers).json()
+
+        start = app_client.post(f"/api/assignments/{created['id']}/start", headers=s_headers).json()
+        attempt_id = start["attempt_id"]
+        token = start["session_token"]
+
+        new_start = now + dt.timedelta(minutes=10)
+        patch = app_client.patch(
+            f"/api/assignments/{created['id']}",
+            json={"starts_at": new_start.isoformat()},
+            headers=headers,
+        )
+        assert patch.status_code == 200
+        updated = patch.json()
+        assert _parse_utc(updated["starts_at"]) == _parse_utc(new_start.isoformat())
+        expected_end = _parse_utc(updated["starts_at"]) + dt.timedelta(minutes=updated["duration_minutes"])
+        assert _parse_utc(updated["ends_at"]) == expected_end
+
+        save_resp = app_client.post(
+            f"/api/attempts/{attempt_id}/save",
+            json={"answers": []},
+            headers={**s_headers, "X-Session-Token": token},
+        )
+        assert save_resp.status_code == 404
+
+    def test_export_results_csv(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        app_client.post(
+            f"/api/groups/{group_id}/students",
+            json={"students": [{"username": "s1", "password": "pass", "display_name": "S1"}]},
+            headers=headers,
+        )
+        s_login = app_client.post("/api/auth/login", json={"username": "s1", "password": "pass"})
+        s_headers = {"Authorization": f"Bearer {s_login.json()['access_token']}"}
+
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": (now - dt.timedelta(minutes=5)).isoformat(),
+            "duration_minutes": 60,
+        }, headers=headers).json()
+
+        start = app_client.post(f"/api/assignments/{created['id']}/start", headers=s_headers).json()
+        quiz_detail = app_client.get(f"/api/quizzes/{quiz_id}", headers=headers).json()
+        by_id = {q["id"]: q for q in quiz_detail["questions"]}
+
+        answers = []
+        for q in start["questions"]:
+            tq = by_id[q["id"]]
+            if tq["q_type"] in ("single", "multiple"):
+                correct_ids = [o["id"] for o in tq["options"] if o["is_correct"]]
+                answers.append({"question_id": q["id"], "selected_option_ids": correct_ids})
+            else:
+                answers.append({"question_id": q["id"], "text_answer": tq["accepted_answers"][0]})
+
+        submit = app_client.post(
+            f"/api/attempts/{start['attempt_id']}/submit",
+            json={"answers": answers},
+            headers={**s_headers, "X-Session-Token": start["session_token"]},
+        )
+        assert submit.status_code == 200
+
+        resp = app_client.get(f"/api/assignments/{created['id']}/results.csv", headers=headers)
+        assert resp.status_code == 200
+        assert "text/csv" in resp.headers["content-type"]
+        assert "attachment" in resp.headers.get("content-disposition", "")
+
+        rows = list(csv.reader(io.StringIO(resp.text.lstrip("\ufeff"))))
+        assert len(rows) == 2
+        header = rows[0]
+        row = rows[1]
+        assert header[:9] == [
+            "student_id",
+            "student_login",
+            "attempt_id",
+            "status",
+            "score",
+            "max_score",
+            "correct_answers_count",
+            "total_questions",
+            "submitted_at",
+        ]
+        assert header[9:] == ["q1_correct", "q2_correct", "q3_correct"]
+        assert row[1] == "s1"
+        assert row[3] == "submitted"
+        assert row[6] == "3"
+        assert row[7] == "3"
+        assert row[9:] == ["1", "1", "1"]

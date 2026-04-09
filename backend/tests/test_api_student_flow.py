@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from tests.conftest import create_test_teacher, create_test_group, create_test_student, SAMPLE_QUIZ_MD
+from app.models import Attempt, Assignment
 
 
 def _setup_full(app_client, db: Session):
@@ -187,3 +188,69 @@ class TestResults:
         data = resp.json()
         assert data["quiz_title"] == "Тестовый квиз"
         assert len(data["results"]) == 1
+
+
+class TestDeadlineEnforcement:
+    def test_save_rejected_when_attempt_time_limit_expired(self, db: Session, app_client):
+        _, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        attempt_id = start["attempt_id"]
+        token = start["session_token"]
+        q = start["questions"][0]
+
+        attempt = db.get(Attempt, attempt_id)
+        assert attempt is not None
+        attempt.started_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30)
+        db.commit()
+
+        resp = app_client.post(
+            f"/api/attempts/{attempt_id}/save",
+            json={"answers": [{"question_id": q["id"], "selected_option_ids": [q["options"][0]["id"]]}]},
+            headers={**s_headers, "X-Session-Token": token},
+        )
+        assert resp.status_code == 409
+
+    def test_save_rejected_when_assignment_window_is_closed(self, db: Session, app_client):
+        _, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        attempt_id = start["attempt_id"]
+        token = start["session_token"]
+        q = start["questions"][0]
+
+        ass = db.get(Assignment, assignment["id"])
+        assert ass is not None
+        ass.ends_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+        db.commit()
+
+        resp = app_client.post(
+            f"/api/attempts/{attempt_id}/save",
+            json={"answers": [{"question_id": q["id"], "selected_option_ids": [q["options"][0]["id"]]}]},
+            headers={**s_headers, "X-Session-Token": token},
+        )
+        assert resp.status_code == 409
+
+    def test_submit_rejected_by_earlier_assignment_end_deadline(self, db: Session, app_client):
+        _, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        attempt_id = start["attempt_id"]
+        token = start["session_token"]
+        q = start["questions"][0]
+
+        attempt = db.get(Attempt, attempt_id)
+        assert attempt is not None
+        attempt.started_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)
+        ass = db.get(Assignment, assignment["id"])
+        assert ass is not None
+        ass.ends_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+        db.commit()
+
+        resp = app_client.post(
+            f"/api/attempts/{attempt_id}/submit",
+            json={"answers": [{"question_id": q["id"], "selected_option_ids": [q["options"][0]["id"]]}]},
+            headers={**s_headers, "X-Session-Token": token},
+        )
+        assert resp.status_code == 409
+
+        db.refresh(attempt)
+        assert attempt.submitted_at is not None
+        assert attempt.submitted_at.replace(tzinfo=None) == ass.ends_at.replace(tzinfo=None)

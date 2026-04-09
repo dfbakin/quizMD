@@ -4,6 +4,14 @@ import { groupApi } from '../api/endpoints';
 import type { StudentOut, GroupOut } from '../types/quiz';
 import ThemeToggle from '../components/ThemeToggle';
 
+function getApiErrorDetail(err: unknown): string | undefined {
+  if (typeof err === 'object' && err !== null && 'response' in err) {
+    const detail = (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
+    if (typeof detail === 'string') return detail;
+  }
+  return undefined;
+}
+
 export default function GroupManage() {
   const { groupId } = useParams<{ groupId: string }>();
   const navigate = useNavigate();
@@ -13,6 +21,11 @@ export default function GroupManage() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
+  const [editingNameId, setEditingNameId] = useState<number | null>(null);
+  const [editingNameValue, setEditingNameValue] = useState('');
+  const [editingPasswordId, setEditingPasswordId] = useState<number | null>(null);
+  const [editingPasswordValue, setEditingPasswordValue] = useState('');
+  const [savingStudentId, setSavingStudentId] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const load = () => {
@@ -50,8 +63,8 @@ export default function GroupManage() {
       setBulkText('');
       flash(`Добавлено ${data.length} учеников`);
       load();
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка при добавлении');
+    } catch (err: unknown) {
+      setError(getApiErrorDetail(err) || 'Ошибка при добавлении');
     }
     setLoading(false);
   };
@@ -71,8 +84,8 @@ export default function GroupManage() {
       const { data } = await groupApi.addStudents(Number(groupId), parsed);
       flash(`Импортировано ${data.length} учеников из ${file.name}`);
       load();
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка при импорте');
+    } catch (err: unknown) {
+      setError(getApiErrorDetail(err) || 'Ошибка при импорте');
     }
     setLoading(false);
     if (fileRef.current) fileRef.current.value = '';
@@ -83,8 +96,58 @@ export default function GroupManage() {
     try {
       await groupApi.removeStudent(Number(groupId), s.id);
       load();
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка при удалении');
+    } catch (err: unknown) {
+      setError(getApiErrorDetail(err) || 'Ошибка при удалении');
+    }
+  };
+
+  const startEditName = (s: StudentOut) => {
+    setEditingNameId(s.id);
+    setEditingNameValue(s.display_name);
+  };
+
+  const saveName = async (studentId: number) => {
+    const value = editingNameValue.trim();
+    if (!value) {
+      setError('Имя не может быть пустым');
+      return;
+    }
+    setSavingStudentId(studentId);
+    setError('');
+    try {
+      await groupApi.updateStudent(Number(groupId), studentId, { display_name: value });
+      setEditingNameId(null);
+      setEditingNameValue('');
+      flash('Имя ученика обновлено');
+      load();
+    } catch (err: unknown) {
+      setError(getApiErrorDetail(err) || 'Ошибка при обновлении имени');
+    } finally {
+      setSavingStudentId(null);
+    }
+  };
+
+  const startEditPassword = (s: StudentOut) => {
+    setEditingPasswordId(s.id);
+    setEditingPasswordValue('');
+  };
+
+  const savePassword = async (studentId: number) => {
+    if (!editingPasswordValue) {
+      setError('Пароль не может быть пустым');
+      return;
+    }
+    setSavingStudentId(studentId);
+    setError('');
+    try {
+      await groupApi.updateStudent(Number(groupId), studentId, { password: editingPasswordValue });
+      setEditingPasswordId(null);
+      setEditingPasswordValue('');
+      flash('Пароль ученика обновлён');
+    } catch (err: unknown) {
+      setError(getApiErrorDetail(err) || 'Ошибка при обновлении пароля');
+    } finally {
+      setSavingStudentId(null);
     }
   };
 
@@ -163,21 +226,86 @@ export default function GroupManage() {
               <tr className="text-left text-gray-500 dark:text-gray-400">
                 <th className="px-5 py-3">Логин</th>
                 <th className="px-5 py-3">Имя</th>
-                <th className="px-5 py-3 w-20"></th>
+                <th className="px-5 py-3 w-72"></th>
               </tr>
             </thead>
             <tbody>
               {students.map((s) => (
                 <tr key={s.id} className="border-b border-gray-100 dark:border-gray-800 last:border-0">
                   <td className="px-5 py-3 font-mono text-gray-700 dark:text-gray-200">{s.username}</td>
-                  <td className="px-5 py-3 text-gray-800 dark:text-gray-100">{s.display_name}</td>
+                  <td className="px-5 py-3 text-gray-800 dark:text-gray-100">
+                    {editingNameId === s.id ? (
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={editingNameValue}
+                          onChange={(e) => setEditingNameValue(e.target.value)}
+                          className="border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded px-2 py-1 text-xs w-44"
+                        />
+                        <button
+                          onClick={() => saveName(s.id)}
+                          disabled={savingStudentId === s.id}
+                          className="text-green-600 dark:text-green-400 text-xs hover:underline disabled:opacity-50"
+                        >
+                          Сохранить
+                        </button>
+                        <button
+                          onClick={() => setEditingNameId(null)}
+                          className="text-gray-500 dark:text-gray-400 text-xs hover:underline"
+                        >
+                          Отмена
+                        </button>
+                      </div>
+                    ) : (
+                      s.display_name
+                    )}
+                  </td>
                   <td className="px-5 py-3 text-right">
-                    <button
-                      onClick={() => handleDelete(s)}
-                      className="text-red-500 dark:text-red-400 text-xs hover:underline"
-                    >
-                      Удалить
-                    </button>
+                    <div className="flex flex-col items-end gap-1">
+                      <div className="flex gap-3">
+                        <button
+                          onClick={() => startEditName(s)}
+                          className="text-blue-600 dark:text-blue-400 text-xs hover:underline"
+                        >
+                          Изменить имя
+                        </button>
+                        <button
+                          onClick={() => startEditPassword(s)}
+                          className="text-indigo-600 dark:text-indigo-400 text-xs hover:underline"
+                        >
+                          Сменить пароль
+                        </button>
+                        <button
+                          onClick={() => handleDelete(s)}
+                          className="text-red-500 dark:text-red-400 text-xs hover:underline"
+                        >
+                          Удалить
+                        </button>
+                      </div>
+                      {editingPasswordId === s.id && (
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={editingPasswordValue}
+                            onChange={(e) => setEditingPasswordValue(e.target.value)}
+                            placeholder="Новый пароль"
+                            className="border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded px-2 py-1 text-xs w-36"
+                          />
+                          <button
+                            onClick={() => savePassword(s.id)}
+                            disabled={savingStudentId === s.id}
+                            className="text-green-600 dark:text-green-400 text-xs hover:underline disabled:opacity-50"
+                          >
+                            Сохранить
+                          </button>
+                          <button
+                            onClick={() => setEditingPasswordId(null)}
+                            className="text-gray-500 dark:text-gray-400 text-xs hover:underline"
+                          >
+                            Отмена
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}

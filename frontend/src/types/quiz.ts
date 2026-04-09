@@ -103,6 +103,8 @@ export interface AttemptStart {
   questions: Question[];
   time_limit_minutes: number | null;
   started_at: string;
+  deadline_at: string;
+  server_now: string;
   saved_answers: SavedAnswer[];
 }
 

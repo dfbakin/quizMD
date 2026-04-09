@@ -121,6 +121,11 @@ class StudentBulkCreate(BaseModel):
     students: list[StudentCreate]
 
 
+class StudentUpdate(BaseModel):
+    display_name: str | None = None
+    password: str | None = None
+
+
 class StudentOut(BaseSchema):
     id: int
     username: str
@@ -181,6 +186,8 @@ class AttemptStart(BaseSchema):
     questions: list[QuestionOut]
     time_limit_minutes: int | None
     started_at: UTCDatetime
+    deadline_at: UTCDatetime
+    server_now: UTCDatetime
     saved_answers: list[SavedAnswer]
 
 
