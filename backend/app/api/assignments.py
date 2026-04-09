@@ -10,7 +10,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Teacher, Assignment, Group, Quiz, Attempt, Answer
+from app.models import Teacher, Assignment, Group, Quiz, Attempt, Answer, AssignmentStudentView
 from app.api.deps import get_current_teacher
 from app.schemas.schemas import (
     AssignmentCreate, AssignmentUpdate, AssignmentOut,
@@ -19,9 +19,29 @@ from app.schemas.schemas import (
 )
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
+_STUDENT_VIEW_MODES = {"closed", "attempt", "results"}
+
+
+def _get_student_view_mode(a: Assignment) -> str:
+    mode = a.student_view.student_view_mode if a.student_view else ("results" if a.results_visible else "closed")
+    if mode not in _STUDENT_VIEW_MODES:
+        return "closed"
+    return mode
+
+
+def _set_student_view_mode(a: Assignment, db: Session, mode: str) -> None:
+    if mode not in _STUDENT_VIEW_MODES:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid student_view_mode")
+    if a.student_view is None:
+        db.add(AssignmentStudentView(assignment_id=a.id, student_view_mode=mode))
+    else:
+        a.student_view.student_view_mode = mode
+    # Keep legacy flag in sync for backward compatibility.
+    a.results_visible = mode == "results"
 
 
 def _assignment_to_out(a: Assignment) -> AssignmentOut:
+    mode = _get_student_view_mode(a)
     return AssignmentOut(
         id=a.id,
         quiz_id=a.quiz_id,
@@ -30,7 +50,8 @@ def _assignment_to_out(a: Assignment) -> AssignmentOut:
         ends_at=a.ends_at,
         duration_minutes=a.duration_minutes,
         time_limit_minutes=a.time_limit_minutes,
-        results_visible=a.results_visible,
+        results_visible=mode == "results",
+        student_view_mode=mode,
         quiz_title=a.quiz.title,
         group_name=a.group.name,
         share_code=a.share_code,
@@ -76,6 +97,8 @@ def create_assignment(
         share_code=secrets.token_urlsafe(6),
     )
     db.add(assignment)
+    db.flush()
+    db.add(AssignmentStudentView(assignment_id=assignment.id, student_view_mode="closed"))
     db.commit()
     db.refresh(assignment)
     return _assignment_to_out(assignment)
@@ -108,8 +131,10 @@ def update_assignment(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
 
     starts_at_changed = False
-    if body.results_visible is not None:
-        assignment.results_visible = body.results_visible
+    if body.student_view_mode is not None:
+        _set_student_view_mode(assignment, db, body.student_view_mode)
+    elif body.results_visible is not None:
+        _set_student_view_mode(assignment, db, "results" if body.results_visible else "closed")
     if body.starts_at is not None:
         new_starts = body.starts_at.replace(tzinfo=None) if body.starts_at.tzinfo else body.starts_at
         starts_at_changed = new_starts != assignment.starts_at
@@ -248,6 +273,7 @@ def get_attempt_detail_teacher(
         student_name=attempt.student.display_name,
         score=attempt.score,
         max_score=max_score,
+        student_view_mode="results",
         submitted_at=attempt.submitted_at,
         questions=question_details,
     )

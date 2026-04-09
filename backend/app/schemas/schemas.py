@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, PlainSerializer
 
@@ -12,6 +12,7 @@ def _utc_ser(v: dt.datetime) -> str:
 
 
 UTCDatetime = Annotated[dt.datetime, PlainSerializer(_utc_ser, return_type=str)]
+StudentViewMode = Literal["closed", "attempt", "results"]
 
 
 class BaseSchema(BaseModel):
@@ -149,6 +150,7 @@ class AssignmentCreate(BaseModel):
 
 class AssignmentUpdate(BaseModel):
     results_visible: bool | None = None
+    student_view_mode: StudentViewMode | None = None
     starts_at: dt.datetime | None = None
     duration_minutes: int | None = None
     time_limit_minutes: int | None = None
@@ -163,6 +165,7 @@ class AssignmentOut(BaseSchema):
     duration_minutes: int
     time_limit_minutes: int | None
     results_visible: bool
+    student_view_mode: StudentViewMode = "closed"
     quiz_title: str
     group_name: str
     share_code: str
@@ -226,6 +229,7 @@ class AttemptResult(BaseSchema):
     student_name: str
     score: float | None
     max_score: int
+    student_view_mode: StudentViewMode = "results"
     submitted_at: UTCDatetime | None
     questions: list[ResultQuestionDetail]
 
@@ -257,6 +261,7 @@ class StudentAssignmentOut(BaseSchema):
     status: str
     attempt_id: int | None = None
     results_visible: bool = False
+    student_view_mode: StudentViewMode = "closed"
 
 
 class ShareCodeLookup(BaseSchema):

@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, type NavigateFunction } from 'react-router-dom';
 import { quizApi, groupApi, assignmentApi } from '../api/endpoints';
-import type { QuizSummary, GroupOut, AssignmentOut } from '../types/quiz';
+import type { QuizSummary, GroupOut, AssignmentOut, StudentViewMode } from '../types/quiz';
 import { useAuth } from '../hooks/useAuth';
 import SearchSelect from '../components/SearchSelect';
 import ThemeToggle from '../components/ThemeToggle';
+import LatexText from '../components/LatexText';
 
 function getApiErrorDetail(err: unknown): string | undefined {
   if (typeof err === 'object' && err !== null && 'response' in err) {
@@ -118,7 +119,9 @@ function QuizzesTab({ quizzes, onReload, navigate }: { quizzes: QuizSummary[]; o
           {quizzes.map((q) => (
             <div key={q.id} className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 p-5 shadow-sm flex justify-between items-center">
               <div>
-                <h3 className="font-semibold text-gray-800 dark:text-gray-100">{q.title}</h3>
+                <h3 className="font-semibold text-gray-800 dark:text-gray-100">
+                  <LatexText text={q.title} className="inline" />
+                </h3>
                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
                   {q.question_count} вопросов · {q.time_limit_minutes ? `${q.time_limit_minutes} мин` : 'без лимита'}
                 </p>
@@ -260,9 +263,37 @@ function AssignmentsTab({
     setAssignments((prev) => [data, ...prev]);
   };
 
-  const toggleResults = async (id: number, visible: boolean) => {
-    setAssignments((prev) => prev.map((a) => a.id === id ? { ...a, results_visible: visible } : a));
-    await assignmentApi.update(id, { results_visible: visible });
+  const modeLabel = (mode: StudentViewMode) => {
+    if (mode === 'closed') return 'Скрыто';
+    if (mode === 'attempt') return 'Показывать попытку';
+    return 'Показывать результаты';
+  };
+
+  const modeClasses = (mode: StudentViewMode) => {
+    if (mode === 'closed') return 'bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-300';
+    if (mode === 'attempt') return 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300';
+    return 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300';
+  };
+
+  const nextMode = (mode: StudentViewMode): StudentViewMode => {
+    if (mode === 'closed') return 'attempt';
+    if (mode === 'attempt') return 'results';
+    return 'closed';
+  };
+
+  const cycleStudentViewMode = async (a: AssignmentOut) => {
+    const next = nextMode(a.student_view_mode);
+    setAssignments((prev) => prev.map((x) => (
+      x.id === a.id ? { ...x, student_view_mode: next, results_visible: next === 'results' } : x
+    )));
+    try {
+      await assignmentApi.update(a.id, { student_view_mode: next });
+    } catch {
+      // Roll back optimistic change on failure.
+      setAssignments((prev) => prev.map((x) => (
+        x.id === a.id ? { ...x, student_view_mode: a.student_view_mode, results_visible: a.student_view_mode === 'results' } : x
+      )));
+    }
   };
 
   const handleDelete = async (id: number) => {
@@ -371,7 +402,9 @@ function AssignmentsTab({
           <div key={a.id} className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 shadow-sm">
             <div className="flex justify-between items-start">
               <div>
-                <h3 className="font-semibold text-gray-800 dark:text-gray-100">{a.quiz_title}</h3>
+                <h3 className="font-semibold text-gray-800 dark:text-gray-100">
+                  <LatexText text={a.quiz_title} className="inline" />
+                </h3>
                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
                   {a.group_name} · доступен {a.duration_minutes} мин · {new Date(a.starts_at).toLocaleString('ru')}
                 </p>
@@ -430,14 +463,10 @@ function AssignmentsTab({
                   {copied === a.id ? 'Скопировано!' : 'Ссылка'}
                 </button>
                 <button
-                  onClick={() => toggleResults(a.id, !a.results_visible)}
-                  className={`text-xs px-3 py-1 rounded-full font-medium transition ${
-                    a.results_visible
-                      ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
-                      : 'bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
-                  }`}
+                  onClick={() => cycleStudentViewMode(a)}
+                  className={`text-xs px-3 py-1 rounded-full font-medium transition ${modeClasses(a.student_view_mode)}`}
                 >
-                  {a.results_visible ? 'Результаты видны' : 'Результаты скрыты'}
+                  {modeLabel(a.student_view_mode)}
                 </button>
                 <button
                   onClick={() => navigate(`/teacher/assignment/${a.id}/results`)}

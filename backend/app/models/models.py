@@ -121,6 +121,18 @@ class Assignment(Base):
     quiz: Mapped[Quiz] = relationship(back_populates="assignments")
     group: Mapped[Group] = relationship(back_populates="assignments")
     attempts: Mapped[list[Attempt]] = relationship(back_populates="assignment", cascade="all, delete-orphan")
+    student_view: Mapped[AssignmentStudentView | None] = relationship(
+        back_populates="assignment", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class AssignmentStudentView(Base):
+    __tablename__ = "assignment_student_views"
+
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), primary_key=True)
+    student_view_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="closed")
+
+    assignment: Mapped[Assignment] = relationship(back_populates="student_view")
 
 
 class Attempt(Base):

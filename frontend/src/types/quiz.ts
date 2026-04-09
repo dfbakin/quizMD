@@ -6,6 +6,8 @@ export interface TokenResponse {
   display_name: string;
 }
 
+export type StudentViewMode = 'closed' | 'attempt' | 'results';
+
 export interface Option {
   id: number;
   order_index: number;
@@ -69,6 +71,7 @@ export interface AssignmentOut {
   duration_minutes: number;
   time_limit_minutes: number | null;
   results_visible: boolean;
+  student_view_mode: StudentViewMode;
   quiz_title: string;
   group_name: string;
   share_code: string;
@@ -84,6 +87,7 @@ export interface StudentAssignment {
   status: 'upcoming' | 'active' | 'completed';
   attempt_id: number | null;
   results_visible: boolean;
+  student_view_mode: StudentViewMode;
 }
 
 export interface ShareCodeLookup {
@@ -135,6 +139,7 @@ export interface AttemptResult {
   student_name: string;
   score: number | null;
   max_score: number;
+  student_view_mode: StudentViewMode;
   submitted_at: string | null;
   questions: ResultQuestionDetail[];
 }

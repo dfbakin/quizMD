@@ -27,7 +27,7 @@ export default function QuizQuestion({ question, index, answer, onChange }: Prop
   return (
     <div className="bg-white dark:bg-gray-900 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6 mb-4">
       <h3 className="text-base font-semibold text-gray-700 dark:text-gray-200 mb-1">
-        Вопрос {index + 1}. {question.title}
+        Вопрос {index + 1}. <LatexText text={question.title} className="inline" />
       </h3>
       <p className="text-xs text-gray-400 dark:text-gray-500 mb-3">
         {question.q_type === 'single' && 'Один вариант ответа'}

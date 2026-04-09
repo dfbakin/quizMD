@@ -189,6 +189,156 @@ class TestResults:
         assert data["quiz_title"] == "Тестовый квиз"
         assert len(data["results"]) == 1
 
+    def test_attempt_view_only_for_submitted_attempts(self, db: Session, app_client):
+        t_headers, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        app_client.patch(
+            f"/api/assignments/{assignment['id']}",
+            json={"student_view_mode": "attempt"},
+            headers=t_headers,
+        )
+
+        resp = app_client.get(f"/api/attempts/{start['attempt_id']}/results", headers=s_headers)
+        assert resp.status_code == 403
+
+    def test_attempt_view_shows_submitted_answers_without_correctness(self, db: Session, app_client):
+        t_headers, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        sh = {**s_headers, "X-Session-Token": start["session_token"]}
+        first_q = start["questions"][0]
+        first_opt = first_q["options"][0]["id"]
+
+        app_client.post(
+            f"/api/attempts/{start['attempt_id']}/submit",
+            json={"answers": [{"question_id": first_q["id"], "selected_option_ids": [first_opt]}]},
+            headers=sh,
+        )
+        app_client.patch(
+            f"/api/assignments/{assignment['id']}",
+            json={"student_view_mode": "attempt"},
+            headers=t_headers,
+        )
+
+        resp = app_client.get(f"/api/attempts/{start['attempt_id']}/results", headers=s_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["student_view_mode"] == "attempt"
+        assert data["score"] is None
+        assert data["max_score"] == 0
+        q0 = data["questions"][0]
+        assert q0["selected_option_ids"] == [first_opt]
+        assert q0["is_correct"] is None
+        assert q0["correct_option_ids"] is None
+        assert q0["accepted_answers"] is None
+        assert q0["explanation_md"] is None
+
+
+class TestDuplicateAttemptHandling:
+    def test_list_prefers_submitted_attempt_when_duplicates_exist(self, db: Session, app_client):
+        _, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        submitted = db.get(Attempt, start["attempt_id"])
+        assert submitted is not None
+        submitted.submitted_at = dt.datetime.now(dt.timezone.utc)
+        submitted.score = 1
+        db.add(Attempt(
+            student_id=submitted.student_id,
+            assignment_id=submitted.assignment_id,
+            session_token=f"dup-token-{submitted.id}",
+            shuffle_seed=f"dup-seed-{submitted.id}",
+        ))
+        db.commit()
+
+        resp = app_client.get("/api/my/assignments", headers=s_headers)
+        assert resp.status_code == 200
+        row = resp.json()[0]
+        assert row["status"] == "completed"
+        assert row["attempt_id"] == submitted.id
+
+    def test_reentry_deduplicates_open_attempts_and_single_submit_finishes(self, db: Session, app_client):
+        _, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        primary = db.get(Attempt, start["attempt_id"])
+        assert primary is not None
+        db.add(Attempt(
+            student_id=primary.student_id,
+            assignment_id=primary.assignment_id,
+            session_token=f"dup-token-open-{primary.id}",
+            shuffle_seed=f"dup-seed-open-{primary.id}",
+        ))
+        db.commit()
+
+        reentry = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers)
+        assert reentry.status_code == 200
+        reentry_data = reentry.json()
+        sh = {**s_headers, "X-Session-Token": reentry_data["session_token"]}
+
+        attempts_after_reentry = (
+            db.query(Attempt)
+            .filter(
+                Attempt.assignment_id == assignment["id"],
+                Attempt.student_id == primary.student_id,
+            )
+            .all()
+        )
+        assert len(attempts_after_reentry) == 1
+
+        submit = app_client.post(
+            f"/api/attempts/{reentry_data['attempt_id']}/submit",
+            json={"answers": []},
+            headers=sh,
+        )
+        assert submit.status_code == 200
+
+        start_again = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers)
+        assert start_again.status_code == 409
+
+        list_resp = app_client.get("/api/my/assignments", headers=s_headers)
+        assert list_resp.status_code == 200
+        assert list_resp.json()[0]["status"] == "completed"
+
+    def test_submit_on_stale_duplicate_is_rejected_and_cleaned(self, db: Session, app_client):
+        _, s_headers, _, assignment = _setup_full(app_client, db)
+        start = app_client.post(f"/api/assignments/{assignment['id']}/start", headers=s_headers).json()
+        sh = {**s_headers, "X-Session-Token": start["session_token"]}
+        first_submit = app_client.post(
+            f"/api/attempts/{start['attempt_id']}/submit",
+            json={"answers": []},
+            headers=sh,
+        )
+        assert first_submit.status_code == 200
+
+        submitted = db.get(Attempt, start["attempt_id"])
+        assert submitted is not None
+        dup = Attempt(
+            student_id=submitted.student_id,
+            assignment_id=submitted.assignment_id,
+            session_token=f"dup-token-stale-{submitted.id}",
+            shuffle_seed=f"dup-seed-stale-{submitted.id}",
+        )
+        db.add(dup)
+        db.commit()
+        db.refresh(dup)
+
+        stale_submit = app_client.post(
+            f"/api/attempts/{dup.id}/submit",
+            json={"answers": []},
+            headers={**s_headers, "X-Session-Token": dup.session_token},
+        )
+        assert stale_submit.status_code == 409
+
+        remaining = (
+            db.query(Attempt)
+            .filter(
+                Attempt.assignment_id == assignment["id"],
+                Attempt.student_id == submitted.student_id,
+            )
+            .all()
+        )
+        assert len(remaining) == 1
+        assert remaining[0].id == submitted.id
+        assert remaining[0].submitted_at is not None
+
 
 class TestDeadlineEnforcement:
     def test_save_rejected_when_attempt_time_limit_expired(self, db: Session, app_client):

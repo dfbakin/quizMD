@@ -71,7 +71,9 @@ export default function TeacherAttemptDetail() {
                 {q.is_correct ? '\u2713' : q.selected_option_ids || q.text_answer ? '\u2717' : '—'}
               </div>
               <div className="flex-1 min-w-0">
-                <h3 className="font-semibold text-gray-800 dark:text-gray-100">Вопрос {i + 1}. {q.title}</h3>
+                <h3 className="font-semibold text-gray-800 dark:text-gray-100">
+                  Вопрос {i + 1}. <LatexText text={q.title} className="inline" />
+                </h3>
               </div>
               <div className={`flex-shrink-0 text-sm font-bold px-2.5 py-1 rounded-lg ${
                 q.is_correct

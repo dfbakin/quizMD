@@ -2,7 +2,7 @@ import api from './client';
 import type {
   TokenResponse, QuizSummary, QuizDetail, GroupOut, StudentOut,
   AssignmentOut, StudentAssignment, AttemptStart, AnswerSave,
-  AttemptResult, AssignmentResultsSummary, ShareCodeLookup,
+  AttemptResult, AssignmentResultsSummary, ShareCodeLookup, StudentViewMode,
 } from '../types/quiz';
 
 export const authApi = {
@@ -45,7 +45,7 @@ export const assignmentApi = {
     api.post<AssignmentOut>('/assignments', data),
   lookupByCode: (code: string) =>
     api.get<ShareCodeLookup>(`/assignments/by-code/${code}`),
-  update: (id: number, data: { results_visible?: boolean; starts_at?: string; duration_minutes?: number; time_limit_minutes?: number }) =>
+  update: (id: number, data: { results_visible?: boolean; student_view_mode?: StudentViewMode; starts_at?: string; duration_minutes?: number; time_limit_minutes?: number }) =>
     api.patch<AssignmentOut>(`/assignments/${id}`, data),
   remove: (id: number) => api.delete(`/assignments/${id}`),
   results: (id: number) => api.get<AssignmentResultsSummary>(`/assignments/${id}/results`),

@@ -25,7 +25,9 @@ export default function QuizDetail() {
       <header className="bg-white dark:bg-gray-900 shadow-sm border-b border-gray-200 dark:border-gray-700">
         <div className="max-w-3xl mx-auto px-4 py-4 flex justify-between items-center">
           <div>
-            <h1 className="text-xl font-bold text-gray-800 dark:text-gray-100">{quiz.title}</h1>
+            <h1 className="text-xl font-bold text-gray-800 dark:text-gray-100">
+              <LatexText text={quiz.title} className="inline" />
+            </h1>
             <p className="text-sm text-gray-500 dark:text-gray-400">
               {quiz.question_count} вопросов · {quiz.time_limit_minutes ? `${quiz.time_limit_minutes} мин` : 'без лимита'}
             </p>
@@ -39,7 +41,9 @@ export default function QuizDetail() {
       <main className="max-w-3xl mx-auto px-4 py-6">
         {quiz.questions.map((q, i) => (
           <div key={q.id} className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 p-6 mb-4 shadow-sm">
-            <h3 className="font-semibold text-gray-700 dark:text-gray-200 mb-1">Вопрос {i + 1}. {q.title}</h3>
+            <h3 className="font-semibold text-gray-700 dark:text-gray-200 mb-1">
+              Вопрос {i + 1}. <LatexText text={q.title} className="inline" />
+            </h3>
             <p className="text-xs text-gray-400 dark:text-gray-500 mb-3">{q.q_type} · {q.points} б.</p>
             <RichText text={q.body_md} className="text-gray-700 dark:text-gray-200 mb-3 text-sm" />
             {q.options.length > 0 && (

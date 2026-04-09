@@ -6,6 +6,7 @@ from .models import (
     Question,
     Option,
     Assignment,
+    AssignmentStudentView,
     Attempt,
     Answer,
 )

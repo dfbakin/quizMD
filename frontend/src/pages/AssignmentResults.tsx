@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { assignmentApi } from '../api/endpoints';
 import type { AssignmentResultsSummary } from '../types/quiz';
 import ThemeToggle from '../components/ThemeToggle';
+import LatexText from '../components/LatexText';
 
 function getErrorDetail(err: unknown): string | undefined {
   if (typeof err === 'object' && err !== null && 'response' in err) {
@@ -66,7 +67,9 @@ export default function AssignmentResults() {
       <header className="bg-white dark:bg-gray-900 shadow-sm border-b border-gray-200 dark:border-gray-700">
         <div className="max-w-4xl mx-auto px-4 py-4 flex justify-between items-center">
           <div>
-            <h1 className="text-xl font-bold text-gray-800 dark:text-gray-100">{data.quiz_title}</h1>
+            <h1 className="text-xl font-bold text-gray-800 dark:text-gray-100">
+              <LatexText text={data.quiz_title} className="inline" />
+            </h1>
             <p className="text-sm text-gray-500 dark:text-gray-400">{data.group_name} · макс. {data.max_score} баллов</p>
           </div>
           <div className="flex items-center gap-2">

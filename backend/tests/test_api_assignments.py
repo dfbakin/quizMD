@@ -43,6 +43,7 @@ class TestAssignmentCRUD:
         assert data["group_name"] == "11А"
         assert data["duration_minutes"] == 60
         assert data["time_limit_minutes"] == 10
+        assert data["student_view_mode"] == "closed"
         assert "share_code" in data
 
     def test_list_assignments(self, db: Session, app_client):
@@ -71,6 +72,34 @@ class TestAssignmentCRUD:
         )
         assert resp.status_code == 200
         assert resp.json()["results_visible"] is True
+        assert resp.json()["student_view_mode"] == "results"
+
+    def test_change_student_view_mode(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": now.isoformat(), "duration_minutes": 60,
+        }, headers=headers).json()
+        assert created["student_view_mode"] == "closed"
+
+        attempt_mode = app_client.patch(
+            f"/api/assignments/{created['id']}",
+            json={"student_view_mode": "attempt"},
+            headers=headers,
+        )
+        assert attempt_mode.status_code == 200
+        assert attempt_mode.json()["student_view_mode"] == "attempt"
+        assert attempt_mode.json()["results_visible"] is False
+
+        results_mode = app_client.patch(
+            f"/api/assignments/{created['id']}",
+            json={"student_view_mode": "results"},
+            headers=headers,
+        )
+        assert results_mode.status_code == 200
+        assert results_mode.json()["student_view_mode"] == "results"
+        assert results_mode.json()["results_visible"] is True
 
     def test_share_code_lookup(self, db: Session, app_client):
         headers, quiz_id, group_id = _setup(app_client, db)

@@ -4,6 +4,7 @@ import { studentApi } from '../api/endpoints';
 import type { StudentAssignment } from '../types/quiz';
 import { useAuth } from '../hooks/useAuth';
 import ThemeToggle from '../components/ThemeToggle';
+import LatexText from '../components/LatexText';
 
 export default function StudentDashboard() {
   const [assignments, setAssignments] = useState<StudentAssignment[]>([]);
@@ -50,7 +51,9 @@ export default function StudentDashboard() {
                   className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 p-5 flex justify-between items-center shadow-sm"
                 >
                   <div>
-                    <h2 className="font-semibold text-gray-800 dark:text-gray-100">{a.quiz_title}</h2>
+                    <h2 className="font-semibold text-gray-800 dark:text-gray-100">
+                      <LatexText text={a.quiz_title} className="inline" />
+                    </h2>
                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
                       {a.time_limit_minutes ? `${a.time_limit_minutes} мин` : 'Без ограничения'}{' · '}
                       до {new Date(a.ends_at).toLocaleString('ru')}
@@ -68,12 +71,12 @@ export default function StudentDashboard() {
                         {a.attempt_id ? 'Продолжить' : 'Начать'}
                       </button>
                     )}
-                    {a.status === 'completed' && a.results_visible && a.attempt_id && (
+                    {a.status === 'completed' && a.attempt_id && a.student_view_mode !== 'closed' && (
                       <button
                         onClick={() => navigate(`/student/results/${a.attempt_id}`)}
                         className="bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 transition"
                       >
-                        Результаты
+                        {a.student_view_mode === 'attempt' ? 'Попытка' : 'Результаты'}
                       </button>
                     )}
                   </div>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random
+import threading
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -27,6 +28,9 @@ from app.schemas.schemas import (
 )
 
 router = APIRouter(tags=["student"])
+_STUDENT_VIEW_MODES = {"closed", "attempt", "results"}
+_ATTEMPT_START_LOCKS: dict[tuple[int, int], threading.Lock] = {}
+_ATTEMPT_START_LOCKS_GUARD = threading.Lock()
 
 
 def _utcnow() -> dt.datetime:
@@ -57,6 +61,64 @@ def _is_attempt_expired(attempt: Attempt, now: dt.datetime) -> bool:
     return now > _attempt_deadline(attempt)
 
 
+def _student_view_mode(assignment: Assignment) -> str:
+    mode = assignment.student_view.student_view_mode if assignment.student_view else ("results" if assignment.results_visible else "closed")
+    if mode not in _STUDENT_VIEW_MODES:
+        return "closed"
+    return mode
+
+
+def _attempt_start_lock(student_id: int, assignment_id: int) -> threading.Lock:
+    key = (student_id, assignment_id)
+    with _ATTEMPT_START_LOCKS_GUARD:
+        lock = _ATTEMPT_START_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ATTEMPT_START_LOCKS[key] = lock
+        return lock
+
+
+def _pick_primary_attempt(attempts: list[Attempt]) -> Attempt:
+    submitted = [a for a in attempts if a.submitted_at]
+    if submitted:
+        return max(
+            submitted,
+            key=lambda a: (_ensure_naive(a.submitted_at) if a.submitted_at else dt.datetime.min, a.id),
+        )
+    # If duplicate unfinished attempts exist, keep the one with most progress.
+    return max(attempts, key=lambda a: (len(a.answers), _ensure_naive(a.started_at), a.id))
+
+
+def _load_primary_attempt(
+    db: Session,
+    *,
+    assignment_id: int,
+    student_id: int,
+    cleanup_duplicates: bool,
+) -> Attempt | None:
+    attempts = (
+        db.query(Attempt)
+        .filter(Attempt.assignment_id == assignment_id, Attempt.student_id == student_id)
+        .order_by(Attempt.id.asc())
+        .all()
+    )
+    if not attempts:
+        return None
+
+    primary = _pick_primary_attempt(attempts)
+    if cleanup_duplicates and len(attempts) > 1:
+        for att in attempts:
+            if att.id != primary.id:
+                db.delete(att)
+        db.commit()
+        refreshed = db.get(Attempt, primary.id)
+        if refreshed is None:
+            return None
+        primary = refreshed
+
+    return primary
+
+
 @router.get("/api/my/assignments", response_model=list[StudentAssignmentOut])
 def list_my_assignments(
     student: Student = Depends(get_current_student),
@@ -71,11 +133,13 @@ def list_my_assignments(
     )
     result = []
     for a in assignments:
-        attempt = (
+        attempts = (
             db.query(Attempt)
             .filter(Attempt.assignment_id == a.id, Attempt.student_id == student.id)
-            .first()
+            .order_by(Attempt.id.asc())
+            .all()
         )
+        attempt = _pick_primary_attempt(attempts) if attempts else None
         tlm = _assignment_time_limit_minutes(a)
         attempt_expired = False
         if attempt and not attempt.submitted_at:
@@ -101,7 +165,8 @@ def list_my_assignments(
             time_limit_minutes=tlm,
             status=s,
             attempt_id=attempt.id if attempt else None,
-            results_visible=a.results_visible,
+            results_visible=_student_view_mode(a) == "results",
+            student_view_mode=_student_view_mode(a),
         ))
     return result
 
@@ -122,69 +187,72 @@ def start_attempt(
     if now > _ensure_naive(assignment.ends_at):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Quiz deadline has passed")
 
-    existing = (
-        db.query(Attempt)
-        .filter(Attempt.assignment_id == assignment_id, Attempt.student_id == student.id)
-        .first()
-    )
-    if existing and existing.submitted_at:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
-
-    tlm = _assignment_time_limit_minutes(assignment)
-
-    if existing:
-        if _is_attempt_expired(existing, now):
-            _auto_grade_expired(existing, db, now=now)
+    lock = _attempt_start_lock(student.id, assignment_id)
+    with lock:
+        existing = _load_primary_attempt(
+            db,
+            assignment_id=assignment_id,
+            student_id=student.id,
+            cleanup_duplicates=True,
+        )
+        if existing and existing.submitted_at:
             raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
 
-        new_token = uuid.uuid4().hex
-        existing.session_token = new_token
-        db.commit()
-        db.refresh(existing)
+        tlm = _assignment_time_limit_minutes(assignment)
 
-        questions = _get_shuffled_questions(assignment, existing.shuffle_seed, db)
-        saved = [
-            SavedAnswer(
-                question_id=a.question_id,
-                selected_option_ids=a.selected_option_ids,
-                text_answer=a.text_answer,
+        if existing:
+            if _is_attempt_expired(existing, now):
+                _auto_grade_expired(existing, db, now=now)
+                raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
+
+            new_token = uuid.uuid4().hex
+            existing.session_token = new_token
+            db.commit()
+            db.refresh(existing)
+
+            questions = _get_shuffled_questions(assignment, existing.shuffle_seed, db)
+            saved = [
+                SavedAnswer(
+                    question_id=a.question_id,
+                    selected_option_ids=a.selected_option_ids,
+                    text_answer=a.text_answer,
+                )
+                for a in existing.answers
+            ]
+            return AttemptStart(
+                attempt_id=existing.id,
+                session_token=new_token,
+                questions=questions,
+                time_limit_minutes=tlm,
+                started_at=existing.started_at,
+                deadline_at=_attempt_deadline(existing),
+                server_now=now,
+                saved_answers=saved,
             )
-            for a in existing.answers
-        ]
+
+        session_token = uuid.uuid4().hex
+        shuffle_seed = uuid.uuid4().hex
+        attempt = Attempt(
+            student_id=student.id,
+            assignment_id=assignment_id,
+            session_token=session_token,
+            shuffle_seed=shuffle_seed,
+        )
+        db.add(attempt)
+        db.commit()
+        db.refresh(attempt)
+
+        questions = _get_shuffled_questions(assignment, shuffle_seed, db)
         return AttemptStart(
-            attempt_id=existing.id,
-            session_token=new_token,
+            attempt_id=attempt.id,
+            session_token=session_token,
             questions=questions,
             time_limit_minutes=tlm,
-            started_at=existing.started_at,
-            deadline_at=_attempt_deadline(existing),
+            started_at=attempt.started_at,
+            deadline_at=_attempt_deadline(attempt),
             server_now=now,
-            saved_answers=saved,
+            saved_answers=[],
         )
-
-    session_token = uuid.uuid4().hex
-    shuffle_seed = uuid.uuid4().hex
-    attempt = Attempt(
-        student_id=student.id,
-        assignment_id=assignment_id,
-        session_token=session_token,
-        shuffle_seed=shuffle_seed,
-    )
-    db.add(attempt)
-    db.commit()
-    db.refresh(attempt)
-
-    questions = _get_shuffled_questions(assignment, shuffle_seed, db)
-    return AttemptStart(
-        attempt_id=attempt.id,
-        session_token=session_token,
-        questions=questions,
-        time_limit_minutes=tlm,
-        started_at=attempt.started_at,
-        deadline_at=_attempt_deadline(attempt),
-        server_now=now,
-        saved_answers=[],
-    )
 
 
 def _auto_grade_expired(attempt: Attempt, db: Session, *, now: dt.datetime | None = None) -> None:
@@ -286,6 +354,23 @@ def submit_attempt(
     if attempt is None or attempt.student_id != student.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attempt not found")
     _verify_session_token(attempt, x_session_token)
+
+    # Defensive guard against duplicate attempts created by concurrent start calls.
+    submitted_sibling = (
+        db.query(Attempt)
+        .filter(
+            Attempt.assignment_id == attempt.assignment_id,
+            Attempt.student_id == attempt.student_id,
+            Attempt.id != attempt.id,
+            Attempt.submitted_at.is_not(None),
+        )
+        .first()
+    )
+    if submitted_sibling is not None:
+        db.delete(attempt)
+        db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
+
     if attempt.submitted_at:
         raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
 
@@ -298,6 +383,18 @@ def submit_attempt(
     db.refresh(attempt)
     attempt.submitted_at = now
     attempt.score = sum(a.points_awarded for a in attempt.answers)
+    duplicate_unfinished = (
+        db.query(Attempt)
+        .filter(
+            Attempt.assignment_id == attempt.assignment_id,
+            Attempt.student_id == attempt.student_id,
+            Attempt.id != attempt.id,
+            Attempt.submitted_at.is_(None),
+        )
+        .all()
+    )
+    for dup in duplicate_unfinished:
+        db.delete(dup)
     db.commit()
 
     return {"status": "submitted", "score": attempt.score}
@@ -357,8 +454,11 @@ def get_attempt_results(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attempt not found")
 
     assignment = attempt.assignment
-    if not assignment.results_visible:
+    view_mode = _student_view_mode(assignment)
+    if view_mode == "closed":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Results not released yet")
+    if view_mode == "attempt" and not attempt.submitted_at:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Attempt is not submitted yet")
 
     quiz = assignment.quiz
     max_score = sum(q.points for q in quiz.questions)
@@ -367,28 +467,54 @@ def get_attempt_results(
     question_details = []
     for q in quiz.questions:
         ans = answers_map.get(q.id)
-        correct_ids = [o.id for o in q.options if o.is_correct]
-        question_details.append(ResultQuestionDetail(
-            question_id=q.id,
-            title=q.title,
-            q_type=q.q_type,
-            points=q.points,
-            points_awarded=ans.points_awarded if ans else 0,
-            is_correct=ans.is_correct if ans else False,
-            selected_option_ids=ans.selected_option_ids if ans else None,
-            text_answer=ans.text_answer if ans else None,
-            correct_option_ids=correct_ids if correct_ids else None,
-            accepted_answers=q.accepted_answers,
-            explanation_md=q.explanation_md,
-            options=[OptionOutTeacher.model_validate(o) for o in q.options],
-            body_md=q.body_md,
-        ))
+        if view_mode == "attempt":
+            question_details.append(ResultQuestionDetail(
+                question_id=q.id,
+                title=q.title,
+                q_type=q.q_type,
+                points=q.points,
+                points_awarded=0,
+                is_correct=None,
+                selected_option_ids=ans.selected_option_ids if ans else None,
+                text_answer=ans.text_answer if ans else None,
+                correct_option_ids=None,
+                accepted_answers=None,
+                explanation_md=None,
+                options=[
+                    OptionOutTeacher(
+                        id=o.id,
+                        order_index=o.order_index,
+                        text_md=o.text_md,
+                        is_correct=False,
+                    )
+                    for o in q.options
+                ],
+                body_md=q.body_md,
+            ))
+        else:
+            correct_ids = [o.id for o in q.options if o.is_correct]
+            question_details.append(ResultQuestionDetail(
+                question_id=q.id,
+                title=q.title,
+                q_type=q.q_type,
+                points=q.points,
+                points_awarded=ans.points_awarded if ans else 0,
+                is_correct=ans.is_correct if ans else False,
+                selected_option_ids=ans.selected_option_ids if ans else None,
+                text_answer=ans.text_answer if ans else None,
+                correct_option_ids=correct_ids if correct_ids else None,
+                accepted_answers=q.accepted_answers,
+                explanation_md=q.explanation_md,
+                options=[OptionOutTeacher.model_validate(o) for o in q.options],
+                body_md=q.body_md,
+            ))
 
     return AttemptResult(
         attempt_id=attempt.id,
         student_name=attempt.student.display_name,
-        score=attempt.score,
-        max_score=max_score,
+        score=attempt.score if view_mode == "results" else None,
+        max_score=max_score if view_mode == "results" else 0,
+        student_view_mode=view_mode,
         submitted_at=attempt.submitted_at,
         questions=question_details,
     )

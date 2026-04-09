@@ -44,7 +44,7 @@ export default function Timer({ deadlineAt, serverNow, onExpire }: TimerProps) {
         isExpired
           ? 'bg-red-600 text-white'
           : isWarning
-            ? 'bg-amber-500 text-white animate-pulse'
+            ? 'bg-amber-500 text-white'
             : 'bg-blue-600 text-white'
       }`}
     >
