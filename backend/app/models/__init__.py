@@ -7,6 +7,7 @@ from .models import (
     Option,
     Assignment,
     AssignmentStudentView,
+    AssignmentExtraStudent,
     Attempt,
     Answer,
 )

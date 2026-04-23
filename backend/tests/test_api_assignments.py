@@ -366,6 +366,15 @@ class TestAssignmentCRUD:
         assert att is not None
         assert att.deadline_at.replace(tzinfo=None) == original_deadline.replace(tzinfo=None)
 
+    def test_create_exposes_extra_student_count_zero_by_default(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+        assert created["extra_student_count"] == 0
+
     def test_export_results_csv(self, db: Session, app_client):
         headers, quiz_id, group_id = _setup(app_client, db)
         app_client.post(
@@ -429,3 +438,274 @@ class TestAssignmentCRUD:
         assert row[6] == "3"
         assert row[7] == "3"
         assert row[9:] == ["1", "1", "1"]
+
+
+def _setup_two_groups(app_client, db: Session):
+    """Shared fixture for extras tests: teacher with two of their own groups
+    plus one student in each. Returns (headers, quiz_id, group_a_id, group_b_id,
+    student_a_id, student_b_id). Student A lives in group A, student B in B."""
+    create_test_teacher(db, "teach", "pass")
+    login = app_client.post("/api/auth/login", json={"username": "teach", "password": "pass"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    group_a = app_client.post("/api/groups", json={"name": "10А"}, headers=headers).json()
+    group_b = app_client.post("/api/groups", json={"name": "10Б"}, headers=headers).json()
+    file = io.BytesIO(SAMPLE_QUIZ_MD.encode())
+    quiz = app_client.post(
+        "/api/quizzes/import", files={"file": ("q.md", file, "text/markdown")}, headers=headers,
+    ).json()
+
+    app_client.post(
+        f"/api/groups/{group_a['id']}/students",
+        json={"students": [{"username": "alice", "password": "pw", "display_name": "Alice"}]},
+        headers=headers,
+    )
+    app_client.post(
+        f"/api/groups/{group_b['id']}/students",
+        json={"students": [{"username": "bob", "password": "pw", "display_name": "Bob"}]},
+        headers=headers,
+    )
+    from app.models import Student
+    alice = db.query(Student).filter_by(username="alice").first()
+    bob = db.query(Student).filter_by(username="bob").first()
+    return headers, quiz["id"], group_a["id"], group_b["id"], alice.id, bob.id
+
+
+class TestAssignmentExtrasCRUD:
+    """End-to-end tests for the per-student access override (AssignmentExtraStudent).
+
+    The scenario that drives this feature: assignment A belongs to group_a;
+    Bob lives in group_b; teacher adds Bob as an extra so he can participate
+    in this one assignment without touching his home group.
+    """
+
+    def test_list_is_empty_by_default(self, db: Session, app_client):
+        headers, quiz_id, group_a_id, _, _, _ = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+
+        resp = app_client.get(f"/api/assignments/{created['id']}/extras", headers=headers)
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_add_extra_student_from_other_group(self, db: Session, app_client):
+        headers, quiz_id, group_a_id, group_b_id, _, bob_id = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+
+        resp = app_client.post(
+            f"/api/assignments/{created['id']}/extras",
+            json={"student_id": bob_id},
+            headers=headers,
+        )
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["id"] == bob_id
+        assert body["display_name"] == "Bob"
+        assert body["home_group_id"] == group_b_id
+        assert body["home_group_name"] == "10Б"
+
+        # AssignmentOut.extra_student_count reflects the new row immediately.
+        listing = app_client.get("/api/assignments", headers=headers).json()
+        assert listing[0]["extra_student_count"] == 1
+
+    def test_add_is_idempotent(self, db: Session, app_client):
+        headers, quiz_id, group_a_id, _, _, bob_id = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+
+        for _ in range(3):
+            r = app_client.post(
+                f"/api/assignments/{created['id']}/extras",
+                json={"student_id": bob_id},
+                headers=headers,
+            )
+            assert r.status_code == 201
+        extras = app_client.get(f"/api/assignments/{created['id']}/extras", headers=headers).json()
+        assert len(extras) == 1
+
+    def test_adding_a_student_from_home_group_is_noop(self, db: Session, app_client):
+        """Students already in the assignment's home group don't need extras —
+        the endpoint returns success but creates no row, so the UI stays
+        consistent if a teacher accidentally picks a home-group student."""
+        headers, quiz_id, group_a_id, _, alice_id, _ = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+
+        r = app_client.post(
+            f"/api/assignments/{created['id']}/extras",
+            json={"student_id": alice_id},
+            headers=headers,
+        )
+        assert r.status_code == 201
+        extras = app_client.get(f"/api/assignments/{created['id']}/extras", headers=headers).json()
+        assert extras == []
+
+    def test_add_rejects_student_not_owned_by_teacher(self, db: Session, app_client):
+        headers, quiz_id, group_a_id, _, _, _ = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+
+        # Second teacher with their own group + student.
+        create_test_teacher(db, "other", "pass")
+        other_login = app_client.post(
+            "/api/auth/login", json={"username": "other", "password": "pass"},
+        )
+        other_headers = {"Authorization": f"Bearer {other_login.json()['access_token']}"}
+        other_group = app_client.post(
+            "/api/groups", json={"name": "O"}, headers=other_headers,
+        ).json()
+        app_client.post(
+            f"/api/groups/{other_group['id']}/students",
+            json={"students": [{"username": "charlie", "password": "pw", "display_name": "Charlie"}]},
+            headers=other_headers,
+        )
+        from app.models import Student
+        charlie = db.query(Student).filter_by(username="charlie").first()
+
+        resp = app_client.post(
+            f"/api/assignments/{created['id']}/extras",
+            json={"student_id": charlie.id},
+            headers=headers,
+        )
+        assert resp.status_code == 404
+
+    def test_remove_extra(self, db: Session, app_client):
+        headers, quiz_id, group_a_id, _, _, bob_id = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+        app_client.post(
+            f"/api/assignments/{created['id']}/extras",
+            json={"student_id": bob_id}, headers=headers,
+        )
+        resp = app_client.delete(
+            f"/api/assignments/{created['id']}/extras/{bob_id}", headers=headers,
+        )
+        assert resp.status_code == 204
+        extras = app_client.get(f"/api/assignments/{created['id']}/extras", headers=headers).json()
+        assert extras == []
+
+    def test_remove_nonexistent_is_idempotent(self, db: Session, app_client):
+        headers, quiz_id, group_a_id, _, _, bob_id = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+        resp = app_client.delete(
+            f"/api/assignments/{created['id']}/extras/{bob_id}", headers=headers,
+        )
+        assert resp.status_code == 204
+
+    def test_delete_assignment_cascades_extras(self, db: Session, app_client):
+        from app.models import AssignmentExtraStudent
+        headers, quiz_id, group_a_id, _, _, bob_id = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+        app_client.post(
+            f"/api/assignments/{created['id']}/extras",
+            json={"student_id": bob_id}, headers=headers,
+        )
+        assert db.query(AssignmentExtraStudent).count() == 1
+
+        app_client.delete(f"/api/assignments/{created['id']}", headers=headers)
+        assert db.query(AssignmentExtraStudent).count() == 0
+
+    def test_cross_teacher_cannot_see_or_touch_extras(self, db: Session, app_client):
+        headers, quiz_id, group_a_id, _, _, bob_id = _setup_two_groups(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_a_id,
+            "starts_at": now.isoformat(), "duration_minutes": 30,
+        }, headers=headers).json()
+
+        create_test_teacher(db, "other", "pass")
+        other_login = app_client.post(
+            "/api/auth/login", json={"username": "other", "password": "pass"},
+        )
+        other_headers = {"Authorization": f"Bearer {other_login.json()['access_token']}"}
+
+        get_resp = app_client.get(
+            f"/api/assignments/{created['id']}/extras", headers=other_headers,
+        )
+        assert get_resp.status_code == 404
+        post_resp = app_client.post(
+            f"/api/assignments/{created['id']}/extras",
+            json={"student_id": bob_id}, headers=other_headers,
+        )
+        assert post_resp.status_code == 404
+        del_resp = app_client.delete(
+            f"/api/assignments/{created['id']}/extras/{bob_id}", headers=other_headers,
+        )
+        assert del_resp.status_code == 404
+
+
+class TestTeacherStudentSearch:
+    """Autocomplete behind /api/my/students."""
+
+    def test_search_returns_only_own_students(self, db: Session, app_client):
+        headers, _, _, _, _, _ = _setup_two_groups(app_client, db)
+
+        # Second teacher with their own students — must not leak.
+        create_test_teacher(db, "other", "pass")
+        other_login = app_client.post(
+            "/api/auth/login", json={"username": "other", "password": "pass"},
+        )
+        other_headers = {"Authorization": f"Bearer {other_login.json()['access_token']}"}
+        other_group = app_client.post(
+            "/api/groups", json={"name": "X"}, headers=other_headers,
+        ).json()
+        app_client.post(
+            f"/api/groups/{other_group['id']}/students",
+            json={"students": [{"username": "xyz", "password": "pw", "display_name": "XYZ"}]},
+            headers=other_headers,
+        )
+
+        resp = app_client.get("/api/my/students", headers=headers)
+        assert resp.status_code == 200
+        names = {r["username"] for r in resp.json()}
+        assert names == {"alice", "bob"}
+
+    def test_search_filters_by_substring_case_insensitive(self, db: Session, app_client):
+        headers, _, _, _, _, _ = _setup_two_groups(app_client, db)
+        resp = app_client.get("/api/my/students?q=bo", headers=headers)
+        assert [r["username"] for r in resp.json()] == ["bob"]
+
+    def test_search_includes_home_group_name(self, db: Session, app_client):
+        headers, _, group_a_id, group_b_id, _, _ = _setup_two_groups(app_client, db)
+        resp = app_client.get("/api/my/students?q=bob", headers=headers).json()
+        assert len(resp) == 1
+        assert resp[0]["group_id"] == group_b_id
+        assert resp[0]["group_name"] == "10Б"
+
+    def test_search_limit_is_respected(self, db: Session, app_client):
+        headers, _, group_a_id, _, _, _ = _setup_two_groups(app_client, db)
+        for i in range(5):
+            app_client.post(
+                f"/api/groups/{group_a_id}/students",
+                json={"students": [{"username": f"extra{i}", "password": "pw", "display_name": f"Extra{i}"}]},
+                headers=headers,
+            )
+        resp = app_client.get("/api/my/students?limit=3", headers=headers).json()
+        assert len(resp) == 3

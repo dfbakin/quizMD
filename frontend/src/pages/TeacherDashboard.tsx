@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { quizApi, groupApi, assignmentApi } from '../api/endpoints';
 import type { QuizSummary, GroupOut, AssignmentOut, StudentViewMode } from '../types/quiz';
@@ -6,12 +6,62 @@ import { useAuth } from '../hooks/useAuth';
 import SearchSelect from '../components/SearchSelect';
 import ThemeToggle from '../components/ThemeToggle';
 import LatexText from '../components/LatexText';
+import AssignmentExtrasEditor from '../components/AssignmentExtrasEditor';
 
 type TeacherTab = 'quizzes' | 'groups' | 'assignments';
 const TEACHER_TABS: TeacherTab[] = ['quizzes', 'groups', 'assignments'];
 
 function parseTab(value: string | null): TeacherTab {
   return TEACHER_TABS.includes(value as TeacherTab) ? (value as TeacherTab) : 'quizzes';
+}
+
+type AssignmentStatusFilter = 'all' | 'active' | 'upcoming' | 'completed';
+const STATUS_FILTERS: AssignmentStatusFilter[] = ['all', 'active', 'upcoming', 'completed'];
+const STATUS_LABELS: Record<AssignmentStatusFilter, string> = {
+  all: 'Все',
+  active: 'Активные',
+  upcoming: 'Предстоящие',
+  completed: 'Завершённые',
+};
+
+function parseStatusFilter(value: string | null): AssignmentStatusFilter {
+  return STATUS_FILTERS.includes(value as AssignmentStatusFilter)
+    ? (value as AssignmentStatusFilter)
+    : 'all';
+}
+
+// Helper hoisted out of the component so the useMemo deps list stays clean —
+// the linter was complaining that an in-component arrow wasn't listed. Takes
+// a raw ?quiz=1,4,7 string and returns the positive-int list.
+function parseIdListParam(raw: string | null): number[] {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((s) => Number(s))
+    .filter((n) => Number.isInteger(n) && n > 0);
+}
+
+// "Active" is the best we can compute client-side without re-deriving
+// attempt state: the start-window is open and the assignment isn't obviously
+// over. We deliberately treat shared-deadline cards the same way — once
+// ends_at is in the past they're "completed", regardless of unsubmitted
+// attempts.
+function computeAssignmentStatus(
+  a: AssignmentOut,
+  now: number,
+): 'upcoming' | 'active' | 'completed' {
+  const starts = new Date(a.starts_at).getTime();
+  const ends = new Date(a.ends_at).getTime();
+  if (now < starts) return 'upcoming';
+  // In per-student mode ends_at is only the start-window close; attempts
+  // started inside the window may still be running. Treat such a card as
+  // active when there are known in-progress attempts. This is the same rule
+  // the student dashboard already uses on its own side.
+  if (now > ends) {
+    if (!a.shared_deadline && a.in_progress_attempts > 0) return 'active';
+    return 'completed';
+  }
+  return 'active';
 }
 
 function getApiErrorDetail(err: unknown): string | undefined {
@@ -240,6 +290,76 @@ function AssignmentsTab({
   quizzes: QuizSummary[];
   groups: GroupOut[];
 }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // --- Filter state -------------------------------------------------------
+  // All four filter knobs are mirrored into ?sp, so reload + back preserve
+  // exactly what the teacher was looking at. Empty or missing param == no
+  // filter (the common case). We store multi-value filters as ?quiz=1,4,7
+  // rather than repeated keys for readability in the URL bar.
+  const quizFilter = useMemo(() => parseIdListParam(searchParams.get('quiz')), [searchParams]);
+  const groupFilter = useMemo(() => parseIdListParam(searchParams.get('group')), [searchParams]);
+  const statusFilter = useMemo(
+    () => parseStatusFilter(searchParams.get('status')),
+    [searchParams],
+  );
+  const searchQuery = searchParams.get('q') ?? '';
+  const collapseByQuiz = searchParams.get('collapse') === 'quiz';
+
+  const updateParam = (key: string, value: string | null) => {
+    setSearchParams((prev) => {
+      const sp = new URLSearchParams(prev);
+      if (value === null || value === '') sp.delete(key);
+      else sp.set(key, value);
+      return sp;
+    });
+  };
+
+  const toggleIdFilter = (key: 'quiz' | 'group', id: number) => {
+    const current = key === 'quiz' ? quizFilter : groupFilter;
+    const next = current.includes(id)
+      ? current.filter((x) => x !== id)
+      : [...current, id];
+    updateParam(key, next.length === 0 ? null : next.join(','));
+  };
+
+  // Computed once per render: the visible list after all filters. The now
+  // timestamp is captured once here so every card sees a consistent "now"
+  // when computing its status.
+  const now = Date.now();
+  const visibleAssignments = useMemo(() => {
+    const needle = searchQuery.trim().toLowerCase();
+    return assignments.filter((a) => {
+      if (quizFilter.length > 0 && !quizFilter.includes(a.quiz_id)) return false;
+      if (groupFilter.length > 0 && !groupFilter.includes(a.group_id)) return false;
+      if (statusFilter !== 'all') {
+        if (computeAssignmentStatus(a, now) !== statusFilter) return false;
+      }
+      if (needle) {
+        const hay = `${a.quiz_title} ${a.group_name}`.toLowerCase();
+        if (!hay.includes(needle)) return false;
+      }
+      return true;
+    });
+  }, [assignments, quizFilter, groupFilter, statusFilter, searchQuery, now]);
+
+  // Group-by-quiz: when active, bucket the visible cards under their quiz
+  // title so a teacher can scan "all Геометрия --- 1 assignments" in one
+  // glance. Preserves the pre-filter order inside each bucket.
+  const groupedVisible = useMemo(() => {
+    if (!collapseByQuiz) return null;
+    const buckets = new Map<number, { title: string; items: AssignmentOut[] }>();
+    for (const a of visibleAssignments) {
+      let bucket = buckets.get(a.quiz_id);
+      if (!bucket) {
+        bucket = { title: a.quiz_title, items: [] };
+        buckets.set(a.quiz_id, bucket);
+      }
+      bucket.items.push(a);
+    }
+    return Array.from(buckets.values());
+  }, [collapseByQuiz, visibleAssignments]);
+
   const [quizId, setQuizId] = useState<number | ''>('');
   const [groupId, setGroupId] = useState<number | ''>('');
   const [startsAt, setStartsAt] = useState('');
@@ -550,9 +670,117 @@ function AssignmentsTab({
         </button>
       </form>
 
-      <div className="space-y-3">
-        {assignments.map((a) => (
-          <div key={a.id} className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 shadow-sm">
+      <FilterBar
+        quizzes={quizzes}
+        groups={groups}
+        quizFilter={quizFilter}
+        groupFilter={groupFilter}
+        statusFilter={statusFilter}
+        searchQuery={searchQuery}
+        collapseByQuiz={collapseByQuiz}
+        totalCount={assignments.length}
+        visibleCount={visibleAssignments.length}
+        onToggleQuiz={(id) => toggleIdFilter('quiz', id)}
+        onToggleGroup={(id) => toggleIdFilter('group', id)}
+        onSetStatus={(s) => updateParam('status', s === 'all' ? null : s)}
+        onSetSearch={(v) => updateParam('q', v)}
+        onSetCollapse={(v) => updateParam('collapse', v ? 'quiz' : null)}
+        onClearAll={() => {
+          setSearchParams((prev) => {
+            const sp = new URLSearchParams(prev);
+            ['quiz', 'group', 'status', 'q', 'collapse'].forEach((k) => sp.delete(k));
+            return sp;
+          });
+        }}
+      />
+
+      {visibleAssignments.length === 0 && assignments.length > 0 && (
+        <div className="text-center text-sm text-gray-500 dark:text-gray-400 py-10">
+          Под текущие фильтры ничего не подходит.
+        </div>
+      )}
+
+      {groupedVisible ? (
+        <div className="space-y-5">
+          {groupedVisible.map((bucket) => (
+            <div key={bucket.title}>
+              <h3 className="text-sm font-semibold text-gray-600 dark:text-gray-300 mb-2">
+                <LatexText text={bucket.title} className="inline" /> · {bucket.items.length}
+              </h3>
+              <div className="space-y-3">
+                {bucket.items.map((a) => renderAssignmentCard(a))}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-3">{visibleAssignments.map((a) => renderAssignmentCard(a))}</div>
+      )}
+
+      {pendingStartChange && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="start-change-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4"
+        >
+          <div className="w-full max-w-md bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-6">
+            <h3 id="start-change-title" className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-2">
+              Что делать с активными попытками?
+            </h3>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-1">
+              {pendingStartChange.inProgressAttempts === 1
+                ? 'Сейчас идёт 1 активная попытка.'
+                : `Сейчас идёт ${pendingStartChange.inProgressAttempts} активных попыток.`}
+            </p>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-5">
+              <strong>Сбросить</strong> — удалит все незавершённые попытки (полный перезапуск теста).
+              Действие необратимо.
+              <br />
+              <strong>Сохранить</strong> — попытки продолжатся со своим текущим таймером;
+              изменится только время старта для тех, кто ещё не начал.
+            </p>
+            <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+              <button
+                onClick={() => setPendingStartChange(null)}
+                className="px-4 py-2 rounded-lg text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={() =>
+                  void commitStartChange(
+                    pendingStartChange.assignmentId,
+                    pendingStartChange.iso,
+                    'keep',
+                  )
+                }
+                className="px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition"
+              >
+                Сохранить попытки
+              </button>
+              <button
+                onClick={() =>
+                  void commitStartChange(
+                    pendingStartChange.assignmentId,
+                    pendingStartChange.iso,
+                    'reset',
+                  )
+                }
+                className="px-4 py-2 rounded-lg text-sm font-medium bg-red-600 text-white hover:bg-red-700 transition"
+              >
+                Сбросить попытки и перезапустить
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  function renderAssignmentCard(a: AssignmentOut) {
+    return (
+      <div key={a.id} className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 shadow-sm">
             <div className="flex justify-between items-start">
               <div>
                 <h3 className="font-semibold text-gray-800 dark:text-gray-100">
@@ -560,6 +788,14 @@ function AssignmentsTab({
                 </h3>
                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
                   {a.group_name} · {new Date(a.starts_at).toLocaleString('ru')}
+                  {a.extra_student_count > 0 && (
+                    <span
+                      className="ml-2 inline-flex items-center text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200"
+                      title="Индивидуально добавленные ученики (не из группы назначения)"
+                    >
+                      +{a.extra_student_count}
+                    </span>
+                  )}
                 </p>
                 <div className="flex items-center gap-2 mt-1">
                   {editingStart === a.id ? (
@@ -693,67 +929,268 @@ function AssignmentsTab({
                 </button>
               </div>
             </div>
+            <AssignmentExtrasEditor
+              assignmentId={a.id}
+              homeGroupId={a.group_id}
+              onCountChange={(count) =>
+                setAssignments((prev) =>
+                  prev.map((x) =>
+                    x.id === a.id ? { ...x, extra_student_count: count } : x,
+                  ),
+                )
+              }
+            />
           </div>
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FilterBar — sticky-at-top multi-select filter strip for the assignments tab.
+// All state lives in the parent (URL-synced); this component is pure render +
+// simple callbacks so open/close menus can stay local.
+// ---------------------------------------------------------------------------
+interface FilterBarProps {
+  quizzes: QuizSummary[];
+  groups: GroupOut[];
+  quizFilter: number[];
+  groupFilter: number[];
+  statusFilter: AssignmentStatusFilter;
+  searchQuery: string;
+  collapseByQuiz: boolean;
+  totalCount: number;
+  visibleCount: number;
+  onToggleQuiz: (id: number) => void;
+  onToggleGroup: (id: number) => void;
+  onSetStatus: (s: AssignmentStatusFilter) => void;
+  onSetSearch: (v: string) => void;
+  onSetCollapse: (v: boolean) => void;
+  onClearAll: () => void;
+}
+
+function FilterBar({
+  quizzes, groups, quizFilter, groupFilter, statusFilter, searchQuery,
+  collapseByQuiz, totalCount, visibleCount,
+  onToggleQuiz, onToggleGroup, onSetStatus, onSetSearch, onSetCollapse, onClearAll,
+}: FilterBarProps) {
+  const [quizMenuOpen, setQuizMenuOpen] = useState(false);
+  const [groupMenuOpen, setGroupMenuOpen] = useState(false);
+  const [quizSearch, setQuizSearch] = useState('');
+  const [groupSearch, setGroupSearch] = useState('');
+  const quizMenuRef = useRef<HTMLDivElement>(null);
+  const groupMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close pop-down when clicking outside. Two refs because the two menus are
+  // independent — the alternative (single "which menu is open" state) adds a
+  // render cycle when switching between them.
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (quizMenuRef.current && !quizMenuRef.current.contains(e.target as Node)) {
+        setQuizMenuOpen(false);
+      }
+      if (groupMenuRef.current && !groupMenuRef.current.contains(e.target as Node)) {
+        setGroupMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const hasAnyFilter =
+    quizFilter.length > 0 ||
+    groupFilter.length > 0 ||
+    statusFilter !== 'all' ||
+    searchQuery !== '' ||
+    collapseByQuiz;
+
+  const filteredQuizzes = quizzes.filter((q) =>
+    q.title.toLowerCase().includes(quizSearch.toLowerCase()),
+  );
+  const filteredGroups = groups.filter((g) =>
+    g.name.toLowerCase().includes(groupSearch.toLowerCase()),
+  );
+
+  const chip = 'text-xs px-2.5 py-1 rounded-full font-medium transition';
+
+  return (
+    <div
+      role="region"
+      aria-label="Фильтры назначений"
+      className="mb-4 flex flex-wrap items-center gap-2 bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 rounded-xl p-3"
+    >
+      <input
+        type="search"
+        value={searchQuery}
+        onChange={(e) => onSetSearch(e.target.value)}
+        placeholder="Поиск по названию теста или группе..."
+        aria-label="Поиск по назначениям"
+        className="flex-1 min-w-[200px] border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+      />
+
+      <div ref={quizMenuRef} className="relative">
+        <button
+          type="button"
+          aria-haspopup="listbox"
+          aria-expanded={quizMenuOpen}
+          onClick={() => setQuizMenuOpen((v) => !v)}
+          className={`${chip} ${
+            quizFilter.length > 0
+              ? 'bg-blue-600 text-white'
+              : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600'
+          }`}
+        >
+          Тесты{quizFilter.length > 0 && ` · ${quizFilter.length}`}
+        </button>
+        {quizMenuOpen && (
+          <div className="absolute z-50 mt-1 w-72 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg p-2">
+            <input
+              type="text"
+              autoFocus
+              value={quizSearch}
+              onChange={(e) => setQuizSearch(e.target.value)}
+              placeholder="Поиск тестов..."
+              className="w-full border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <ul role="listbox" aria-multiselectable="true" className="mt-1 max-h-56 overflow-y-auto">
+              {filteredQuizzes.length === 0 ? (
+                <li className="px-2 py-1.5 text-xs text-gray-400 dark:text-gray-500">
+                  Ничего не найдено
+                </li>
+              ) : (
+                filteredQuizzes.map((q) => {
+                  const selected = quizFilter.includes(q.id);
+                  return (
+                    <li key={q.id}>
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        onClick={() => onToggleQuiz(q.id)}
+                        className="w-full text-left px-2 py-1.5 text-sm rounded hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-200 flex items-center gap-2"
+                      >
+                        <span
+                          aria-hidden="true"
+                          className={`inline-block w-4 h-4 rounded border ${
+                            selected
+                              ? 'bg-blue-600 border-blue-600'
+                              : 'border-gray-300 dark:border-gray-500'
+                          } flex items-center justify-center text-white text-[10px] leading-none`}
+                        >
+                          {selected ? '✓' : ''}
+                        </span>
+                        <span className="truncate">{q.title}</span>
+                      </button>
+                    </li>
+                  );
+                })
+              )}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      <div ref={groupMenuRef} className="relative">
+        <button
+          type="button"
+          aria-haspopup="listbox"
+          aria-expanded={groupMenuOpen}
+          onClick={() => setGroupMenuOpen((v) => !v)}
+          className={`${chip} ${
+            groupFilter.length > 0
+              ? 'bg-blue-600 text-white'
+              : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600'
+          }`}
+        >
+          Группы{groupFilter.length > 0 && ` · ${groupFilter.length}`}
+        </button>
+        {groupMenuOpen && (
+          <div className="absolute z-50 mt-1 w-64 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg p-2">
+            <input
+              type="text"
+              autoFocus
+              value={groupSearch}
+              onChange={(e) => setGroupSearch(e.target.value)}
+              placeholder="Поиск групп..."
+              className="w-full border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <ul role="listbox" aria-multiselectable="true" className="mt-1 max-h-56 overflow-y-auto">
+              {filteredGroups.length === 0 ? (
+                <li className="px-2 py-1.5 text-xs text-gray-400 dark:text-gray-500">
+                  Ничего не найдено
+                </li>
+              ) : (
+                filteredGroups.map((g) => {
+                  const selected = groupFilter.includes(g.id);
+                  return (
+                    <li key={g.id}>
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        onClick={() => onToggleGroup(g.id)}
+                        className="w-full text-left px-2 py-1.5 text-sm rounded hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-200 flex items-center gap-2"
+                      >
+                        <span
+                          aria-hidden="true"
+                          className={`inline-block w-4 h-4 rounded border ${
+                            selected
+                              ? 'bg-blue-600 border-blue-600'
+                              : 'border-gray-300 dark:border-gray-500'
+                          } flex items-center justify-center text-white text-[10px] leading-none`}
+                        >
+                          {selected ? '✓' : ''}
+                        </span>
+                        <span className="truncate">{g.name}</span>
+                      </button>
+                    </li>
+                  );
+                })
+              )}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      <div role="radiogroup" aria-label="Статус" className="flex items-center gap-1">
+        {STATUS_FILTERS.map((s) => (
+          <button
+            key={s}
+            type="button"
+            role="radio"
+            aria-checked={statusFilter === s}
+            onClick={() => onSetStatus(s)}
+            className={`${chip} ${
+              statusFilter === s
+                ? 'bg-blue-600 text-white'
+                : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600'
+            }`}
+          >
+            {STATUS_LABELS[s]}
+          </button>
         ))}
       </div>
 
-      {pendingStartChange && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="start-change-title"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4"
+      <label className="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={collapseByQuiz}
+          onChange={(e) => onSetCollapse(e.target.checked)}
+          className="accent-blue-600"
+        />
+        Группировать по тесту
+      </label>
+
+      <span className="text-xs text-gray-500 dark:text-gray-400 ml-auto">
+        {hasAnyFilter ? `${visibleCount} / ${totalCount}` : `${totalCount}`}
+      </span>
+      {hasAnyFilter && (
+        <button
+          type="button"
+          onClick={onClearAll}
+          className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
         >
-          <div className="w-full max-w-md bg-white dark:bg-gray-900 rounded-2xl shadow-xl p-6">
-            <h3 id="start-change-title" className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-2">
-              Что делать с активными попытками?
-            </h3>
-            <p className="text-sm text-gray-600 dark:text-gray-300 mb-1">
-              {pendingStartChange.inProgressAttempts === 1
-                ? 'Сейчас идёт 1 активная попытка.'
-                : `Сейчас идёт ${pendingStartChange.inProgressAttempts} активных попыток.`}
-            </p>
-            <p className="text-sm text-gray-600 dark:text-gray-300 mb-5">
-              <strong>Сбросить</strong> — удалит все незавершённые попытки (полный перезапуск теста).
-              Действие необратимо.
-              <br />
-              <strong>Сохранить</strong> — попытки продолжатся со своим текущим таймером;
-              изменится только время старта для тех, кто ещё не начал.
-            </p>
-            <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
-              <button
-                onClick={() => setPendingStartChange(null)}
-                className="px-4 py-2 rounded-lg text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition"
-              >
-                Отмена
-              </button>
-              <button
-                onClick={() =>
-                  void commitStartChange(
-                    pendingStartChange.assignmentId,
-                    pendingStartChange.iso,
-                    'keep',
-                  )
-                }
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition"
-              >
-                Сохранить попытки
-              </button>
-              <button
-                onClick={() =>
-                  void commitStartChange(
-                    pendingStartChange.assignmentId,
-                    pendingStartChange.iso,
-                    'reset',
-                  )
-                }
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-red-600 text-white hover:bg-red-700 transition"
-              >
-                Сбросить попытки и перезапустить
-              </button>
-            </div>
-          </div>
-        </div>
+          Сбросить
+        </button>
       )}
     </div>
   );

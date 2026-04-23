@@ -83,6 +83,30 @@ export interface AssignmentOut {
   group_name: string;
   share_code: string;
   in_progress_attempts: number;
+  // Number of AssignmentExtraStudent rows attached — rendered as a badge on
+  // the card so the teacher knows at-a-glance whether any students from
+  // outside the home group have access.
+  extra_student_count: number;
+}
+
+// Per-student access override ("Бобу из 10Б разрешено пройти этот тест 10А").
+// Returned from GET /api/assignments/{id}/extras.
+export interface AssignmentExtraStudent {
+  id: number;
+  display_name: string;
+  username: string;
+  home_group_id: number;
+  home_group_name: string;
+}
+
+// Autocomplete payload for the "add extra student" picker. Carries the
+// student's home group name so 'Иванов (10А)' can render in one request.
+export interface StudentSearchResult {
+  id: number;
+  username: string;
+  display_name: string;
+  group_id: number;
+  group_name: string;
 }
 
 export type StudentAssignmentStatus = 'upcoming' | 'active' | 'completed';

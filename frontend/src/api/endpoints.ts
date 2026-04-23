@@ -3,7 +3,7 @@ import type {
   TokenResponse, QuizSummary, QuizDetail, GroupOut, StudentOut,
   AssignmentOut, StudentAssignment, AttemptStart, AnswerSave,
   AttemptResult, AssignmentResultsSummary, ShareCodeLookup, StudentViewMode,
-  HeartbeatResponse,
+  HeartbeatResponse, AssignmentExtraStudent, StudentSearchResult,
 } from '../types/quiz';
 
 export const authApi = {
@@ -77,6 +77,25 @@ export const assignmentApi = {
     api.get<Blob>(`/assignments/${id}/results.csv`, { responseType: 'blob' }),
   attemptDetail: (assignmentId: number, attemptId: number) =>
     api.get<AttemptResult>(`/assignments/${assignmentId}/attempts/${attemptId}`),
+  // Per-student access overrides — lets a teacher grant one-off access to a
+  // student from another group without moving them out of their home group.
+  listExtras: (assignmentId: number) =>
+    api.get<AssignmentExtraStudent[]>(`/assignments/${assignmentId}/extras`),
+  addExtra: (assignmentId: number, studentId: number) =>
+    api.post<AssignmentExtraStudent>(
+      `/assignments/${assignmentId}/extras`,
+      { student_id: studentId },
+    ),
+  removeExtra: (assignmentId: number, studentId: number) =>
+    api.delete(`/assignments/${assignmentId}/extras/${studentId}`),
+};
+
+export const teacherApi = {
+  // Autocomplete for the 'add extra student' picker: searches across every
+  // group the logged-in teacher owns. Empty `q` returns the first N students
+  // (useful for an initial open-state dropdown).
+  searchMyStudents: (q: string, limit = 20) =>
+    api.get<StudentSearchResult[]>('/my/students', { params: { q, limit } }),
 };
 
 export const studentApi = {

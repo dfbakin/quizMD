@@ -851,3 +851,197 @@ class TestHeartbeat:
             headers={**s_headers, "X-Session-Token": "wrong"},
         )
         assert resp.status_code == 403
+
+
+class TestAssignmentExtrasStudentAccess:
+    """End-to-end coverage of the visibility/start rules once an extras row
+    grants a cross-group student access. Each test here is the 'Bob from
+    group-B joins a live test for group-A' scenario."""
+
+    def _setup(self, app_client, db: Session):
+        create_test_teacher(db, "teach", "pass")
+        t_login = app_client.post(
+            "/api/auth/login", json={"username": "teach", "password": "pass"},
+        )
+        t_headers = {"Authorization": f"Bearer {t_login.json()['access_token']}"}
+
+        group_a = app_client.post("/api/groups", json={"name": "10А"}, headers=t_headers).json()
+        group_b = app_client.post("/api/groups", json={"name": "10Б"}, headers=t_headers).json()
+        app_client.post(
+            f"/api/groups/{group_a['id']}/students",
+            json={"students": [{"username": "alice", "password": "pw", "display_name": "Alice"}]},
+            headers=t_headers,
+        )
+        app_client.post(
+            f"/api/groups/{group_b['id']}/students",
+            json={"students": [{"username": "bob", "password": "pw", "display_name": "Bob"}]},
+            headers=t_headers,
+        )
+
+        file = io.BytesIO(SAMPLE_QUIZ_MD.encode())
+        quiz = app_client.post(
+            "/api/quizzes/import",
+            files={"file": ("q.md", file, "text/markdown")},
+            headers=t_headers,
+        ).json()
+
+        now = dt.datetime.now(dt.timezone.utc)
+        assignment = app_client.post("/api/assignments", json={
+            "quiz_id": quiz["id"],
+            "group_id": group_a["id"],
+            "starts_at": (now - dt.timedelta(minutes=1)).isoformat(),
+            "duration_minutes": 30,
+        }, headers=t_headers).json()
+
+        from app.models import Student
+        bob = db.query(Student).filter_by(username="bob").first()
+        alice = db.query(Student).filter_by(username="alice").first()
+
+        bob_login = app_client.post("/api/auth/login", json={"username": "bob", "password": "pw"})
+        bob_headers = {"Authorization": f"Bearer {bob_login.json()['access_token']}"}
+        alice_login = app_client.post("/api/auth/login", json={"username": "alice", "password": "pw"})
+        alice_headers = {"Authorization": f"Bearer {alice_login.json()['access_token']}"}
+
+        return {
+            "t_headers": t_headers,
+            "bob_headers": bob_headers,
+            "alice_headers": alice_headers,
+            "assignment": assignment,
+            "alice_id": alice.id,
+            "bob_id": bob.id,
+            "group_a_id": group_a["id"],
+        }
+
+    def test_bob_does_not_see_group_a_assignment_without_extra_row(self, db: Session, app_client):
+        ctx = self._setup(app_client, db)
+        resp = app_client.get("/api/my/assignments", headers=ctx["bob_headers"])
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_bob_cannot_start_group_a_assignment_without_extra_row(self, db: Session, app_client):
+        ctx = self._setup(app_client, db)
+        resp = app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/start",
+            headers=ctx["bob_headers"],
+        )
+        # 404 (not 403) so we don't leak the assignment's existence.
+        assert resp.status_code == 404
+
+    def test_alice_still_sees_it_after_unrelated_extras_row_is_added(self, db: Session, app_client):
+        """Sanity check: adding Bob as an extra doesn't affect Alice's listing.
+        Protects against an accidental DISTINCT/subquery bug that double-filters."""
+        ctx = self._setup(app_client, db)
+        app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/extras",
+            json={"student_id": ctx["bob_id"]},
+            headers=ctx["t_headers"],
+        )
+        resp = app_client.get("/api/my/assignments", headers=ctx["alice_headers"]).json()
+        assert len(resp) == 1
+        assert resp[0]["assignment_id"] == ctx["assignment"]["id"]
+
+    def test_bob_sees_and_starts_assignment_after_extra_row_added(self, db: Session, app_client):
+        ctx = self._setup(app_client, db)
+        app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/extras",
+            json={"student_id": ctx["bob_id"]},
+            headers=ctx["t_headers"],
+        )
+
+        listing = app_client.get("/api/my/assignments", headers=ctx["bob_headers"]).json()
+        assert [a["assignment_id"] for a in listing] == [ctx["assignment"]["id"]]
+
+        start = app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/start",
+            headers=ctx["bob_headers"],
+        )
+        assert start.status_code == 200
+
+    def test_bob_can_submit_and_grade_normally(self, db: Session, app_client):
+        ctx = self._setup(app_client, db)
+        app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/extras",
+            json={"student_id": ctx["bob_id"]},
+            headers=ctx["t_headers"],
+        )
+
+        start = app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/start",
+            headers=ctx["bob_headers"],
+        ).json()
+
+        quiz_detail = app_client.get(
+            f"/api/quizzes/{ctx['assignment']['quiz_id']}", headers=ctx["t_headers"],
+        ).json()
+        by_id = {q["id"]: q for q in quiz_detail["questions"]}
+
+        answers = []
+        for q in start["questions"]:
+            tq = by_id[q["id"]]
+            if tq["q_type"] in ("single", "multiple"):
+                correct_ids = [o["id"] for o in tq["options"] if o["is_correct"]]
+                answers.append({"question_id": q["id"], "selected_option_ids": correct_ids})
+            else:
+                answers.append({"question_id": q["id"], "text_answer": tq["accepted_answers"][0]})
+
+        submit = app_client.post(
+            f"/api/attempts/{start['attempt_id']}/submit",
+            json={"answers": answers},
+            headers={**ctx["bob_headers"], "X-Session-Token": start["session_token"]},
+        )
+        assert submit.status_code == 200
+        assert submit.json()["score"] > 0
+
+    def test_removing_extra_mid_attempt_does_not_invalidate_existing_attempt(
+        self, db: Session, app_client,
+    ):
+        """Revoking the extras row only gates *future* access; an in-flight
+        attempt keeps its snapshotted deadline and saved answers. Otherwise a
+        teacher could destroy student work by a misclick."""
+        ctx = self._setup(app_client, db)
+        app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/extras",
+            json={"student_id": ctx["bob_id"]},
+            headers=ctx["t_headers"],
+        )
+        start = app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/start",
+            headers=ctx["bob_headers"],
+        ).json()
+
+        # Revoke the extras row mid-attempt.
+        app_client.delete(
+            f"/api/assignments/{ctx['assignment']['id']}/extras/{ctx['bob_id']}",
+            headers=ctx["t_headers"],
+        )
+
+        # Attempt row still exists and its deadline is untouched.
+        att = db.get(Attempt, start["attempt_id"])
+        assert att is not None
+        assert att.submitted_at is None
+
+        # Save against the existing session keeps working — the session token
+        # is sufficient, access re-check isn't done on save.
+        resp = app_client.post(
+            f"/api/attempts/{start['attempt_id']}/save",
+            json={"answers": []},
+            headers={**ctx["bob_headers"], "X-Session-Token": start["session_token"]},
+        )
+        assert resp.status_code == 200
+
+    def test_deleting_student_cascades_extras_row(self, db: Session, app_client):
+        from app.models import AssignmentExtraStudent, Student
+        ctx = self._setup(app_client, db)
+        app_client.post(
+            f"/api/assignments/{ctx['assignment']['id']}/extras",
+            json={"student_id": ctx["bob_id"]},
+            headers=ctx["t_headers"],
+        )
+        assert db.query(AssignmentExtraStudent).count() == 1
+
+        # Use ORM delete so SQLAlchemy issues the child-delete cascade defined
+        # on the FK (ON DELETE CASCADE). Mirrors the teacher-deletes-student flow.
+        bob = db.get(Student, ctx["bob_id"])
+        db.delete(bob)
+        db.commit()
+        assert db.query(AssignmentExtraStudent).count() == 0

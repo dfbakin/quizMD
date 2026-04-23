@@ -53,6 +53,13 @@ class Student(Base):
 
     group: Mapped[Group] = relationship(back_populates="students")
     attempts: Mapped[list[Attempt]] = relationship(back_populates="student", cascade="all, delete-orphan")
+    # ORM-side of assignment_extra_students — lets `db.delete(student)` tidy
+    # up the override rows without depending on DB-level FK cascade
+    # (SQLite ignores it; Postgres honors it). Keeping both sides in sync
+    # means the same test passes on either backend.
+    extra_assignment_memberships: Mapped[list[AssignmentExtraStudent]] = relationship(
+        cascade="all, delete-orphan"
+    )
 
 
 class Quiz(Base):
@@ -139,6 +146,11 @@ class Assignment(Base):
     student_view: Mapped[AssignmentStudentView | None] = relationship(
         back_populates="assignment", cascade="all, delete-orphan", uselist=False
     )
+    # ORM-level cascade so `db.delete(assignment)` removes extras rows without
+    # relying on the DB-level FK cascade (SQLite ignores it by default).
+    extra_students: Mapped[list[AssignmentExtraStudent]] = relationship(
+        back_populates="assignment", cascade="all, delete-orphan"
+    )
 
 
 class AssignmentStudentView(Base):
@@ -148,6 +160,29 @@ class AssignmentStudentView(Base):
     student_view_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="closed")
 
     assignment: Mapped[Assignment] = relationship(back_populates="student_view")
+
+
+class AssignmentExtraStudent(Base):
+    """Per-assignment access override letting a student from another group take
+    this specific assignment without moving them out of their home group.
+
+    Access rule becomes: a student sees/starts an assignment iff
+    ``assignment.group_id == student.group_id`` OR a row exists here.
+    """
+
+    __tablename__ = "assignment_extra_students"
+
+    assignment_id: Mapped[int] = mapped_column(
+        ForeignKey("assignments.id", ondelete="CASCADE"), primary_key=True
+    )
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), primary_key=True
+    )
+    added_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+    assignment: Mapped[Assignment] = relationship(back_populates="extra_students")
 
 
 class Attempt(Base):

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api import auth, quizzes, groups, assignments, students
+from app.api.groups import my_router as groups_my_router
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(quizzes.router)
 app.include_router(groups.router)
+app.include_router(groups_my_router)
 app.include_router(assignments.router)
 app.include_router(students.router)
 

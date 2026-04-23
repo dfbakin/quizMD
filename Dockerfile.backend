@@ -6,6 +6,13 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app ./app
+# alembic.ini + alembic/ live one level up from app/ so the in-container layout
+# (WORKDIR=/app, alembic.ini at /app/alembic.ini, env.py at /app/alembic/env.py)
+# matches the dev layout (WORKDIR=backend/, alembic.ini at backend/alembic.ini).
+# This is required so `docker compose run --rm backend alembic upgrade head`
+# can find both the config and the script_location.
+COPY backend/alembic.ini ./alembic.ini
+COPY backend/alembic ./alembic
 COPY scripts ./scripts
 COPY quizzes ./quizzes
 

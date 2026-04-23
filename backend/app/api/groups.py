@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -8,10 +9,61 @@ from app.models import Teacher, Group, Student
 from app.api.deps import get_current_teacher
 from app.auth.passwords import hash_password
 from app.schemas.schemas import (
-    GroupCreate, GroupOut, StudentCreate, StudentBulkCreate, StudentOut, StudentUpdate,
+    GroupCreate, GroupOut, StudentCreate, StudentBulkCreate, StudentOut,
+    StudentSearchOut, StudentUpdate,
 )
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
+
+# Second router for teacher-scoped "my …" endpoints that aren't nested under a
+# specific group (e.g. searching students across all groups the teacher owns).
+# Kept in this file so all the teacher↔student glue stays in one place.
+my_router = APIRouter(prefix="/api/my", tags=["teacher"])
+
+
+@my_router.get("/students", response_model=list[StudentSearchOut])
+def search_my_students(
+    q: str | None = Query(default=None, description="Case-insensitive substring match on display_name or username"),
+    limit: int = Query(default=20, ge=1, le=100),
+    teacher: Teacher = Depends(get_current_teacher),
+    db: Session = Depends(get_db),
+):
+    """Autocomplete for 'add extra student' across every group the teacher owns.
+
+    We join on Group to enforce teacher-ownership in SQL (no chance of leaking
+    another teacher's students even if the filter below misfires). ``q`` is
+    optional so callers can just preload the first N.
+    """
+    base = (
+        db.query(Student, Group)
+        .join(Group, Group.id == Student.group_id)
+        .filter(Group.teacher_id == teacher.id)
+    )
+    if q:
+        pattern = f"%{q.strip()}%"
+        base = base.filter(
+            or_(
+                Student.display_name.ilike(pattern),
+                Student.username.ilike(pattern),
+            )
+        )
+
+    rows = (
+        base
+        .order_by(Student.display_name.asc(), Student.id.asc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        StudentSearchOut(
+            id=s.id,
+            username=s.username,
+            display_name=s.display_name,
+            group_id=g.id,
+            group_name=g.name,
+        )
+        for s, g in rows
+    ]
 
 
 @router.post("", response_model=GroupOut, status_code=201)

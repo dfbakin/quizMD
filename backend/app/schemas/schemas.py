@@ -136,6 +136,17 @@ class StudentOut(BaseSchema):
     model_config = {"from_attributes": True}
 
 
+class StudentSearchOut(BaseSchema):
+    """Autocomplete payload for the 'add extra student' picker. Carries the
+    student's home group name so the UI can render 'Иванов (10А)' in a single
+    request."""
+    id: int
+    username: str
+    display_name: str
+    group_id: int
+    group_name: str
+
+
 # ---------------------------------------------------------------------------
 # Assignments
 # ---------------------------------------------------------------------------
@@ -189,8 +200,27 @@ class AssignmentOut(BaseSchema):
     group_name: str
     share_code: str
     in_progress_attempts: int = 0
+    # Count of AssignmentExtraStudent rows — rendered as a badge so the UI
+    # knows whether the "extras" section on the card is populated without an
+    # extra roundtrip.
+    extra_student_count: int = 0
 
     model_config = {"from_attributes": True}
+
+
+class AssignmentExtraStudentOut(BaseSchema):
+    """Row returned by GET /api/assignments/{id}/extras. ``home_group_name``
+    is denormalized so the frontend can render 'Иванов (10А)' chips without
+    a second lookup."""
+    id: int
+    display_name: str
+    username: str
+    home_group_id: int
+    home_group_name: str
+
+
+class AssignmentExtraStudentCreate(BaseModel):
+    student_id: int
 
 
 # ---------------------------------------------------------------------------

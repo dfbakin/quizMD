@@ -8,10 +8,13 @@ import threading
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Student, Assignment, Attempt, Answer, Question
+from app.models import (
+    Student, Assignment, Attempt, Answer, Question, AssignmentExtraStudent,
+)
 from app.api.deps import get_current_student
 from app.services.grader import grade_answer
 from app.schemas.schemas import (
@@ -67,6 +70,28 @@ def _student_view_mode(assignment: Assignment) -> str:
     if mode not in _STUDENT_VIEW_MODES:
         return "closed"
     return mode
+
+
+def _is_extra_student(db: Session, assignment_id: int, student_id: int) -> bool:
+    """True iff an override row grants this student access to this assignment."""
+    return (
+        db.query(AssignmentExtraStudent)
+        .filter_by(assignment_id=assignment_id, student_id=student_id)
+        .first()
+        is not None
+    )
+
+
+def _assignment_visible_to(a: Assignment, student: Student, db: Session) -> bool:
+    """Single source of truth for 'can this student see/start this assignment?'.
+
+    An assignment is visible iff the student is in the assignment's home group
+    OR an AssignmentExtraStudent row grants them access. Keeping this in one
+    place means list_my_assignments and start_attempt can never drift.
+    """
+    if a.group_id == student.group_id:
+        return True
+    return _is_extra_student(db, a.id, student.id)
 
 
 def _attempt_start_lock(student_id: int, assignment_id: int) -> threading.Lock:
@@ -126,10 +151,24 @@ def list_my_assignments(
     db: Session = Depends(get_db),
 ):
     now = _utcnow()
+    # Visible set = assignments of the student's home group UNION assignments
+    # where an AssignmentExtraStudent row grants them one-off access. The
+    # subquery keeps the shape of the query simple (one SELECT, OR'd WHERE);
+    # DISTINCT guards against a student being both group-matched and extra'd
+    # (shouldn't happen in practice, but costs nothing to defend).
+    extras_subq = select(AssignmentExtraStudent.assignment_id).where(
+        AssignmentExtraStudent.student_id == student.id
+    )
     assignments = (
         db.query(Assignment)
-        .filter(Assignment.group_id == student.group_id)
+        .filter(
+            or_(
+                Assignment.group_id == student.group_id,
+                Assignment.id.in_(extras_subq),
+            )
+        )
         .order_by(Assignment.starts_at.desc())
+        .distinct()
         .all()
     )
     result = []
@@ -181,7 +220,9 @@ def start_attempt(
     db: Session = Depends(get_db),
 ):
     assignment = db.get(Assignment, assignment_id)
-    if assignment is None or assignment.group_id != student.group_id:
+    if assignment is None or not _assignment_visible_to(assignment, student, db):
+        # 404 (not 403) is intentional: we don't want to leak whether the
+        # assignment exists to a student who has no business seeing it.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
 
     now = _utcnow()

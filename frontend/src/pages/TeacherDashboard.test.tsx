@@ -5,7 +5,7 @@ import { MemoryRouter } from 'react-router-dom';
 
 import TeacherDashboard from './TeacherDashboard';
 import { AuthProvider } from '../hooks/useAuth';
-import { quizApi, groupApi, assignmentApi } from '../api/endpoints';
+import { quizApi, groupApi, assignmentApi, teacherApi } from '../api/endpoints';
 import type { AssignmentOut, GroupOut, QuizSummary } from '../types/quiz';
 
 function seedAuth() {
@@ -43,6 +43,7 @@ const ASSIGNMENT: AssignmentOut = {
   group_name: '10-A',
   share_code: 'abcd1234',
   in_progress_attempts: 0,
+  extra_student_count: 0,
 };
 
 const SHARED_ASSIGNMENT: AssignmentOut = {
@@ -403,5 +404,319 @@ describe('TeacherDashboard shared_deadline mode', () => {
     });
     // In shared mode we never send start_window_minutes — the server pins it.
     expect(payload).not.toHaveProperty('start_window_minutes');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Filter bar (Quiz, Group, Status, search, collapse-by-quiz, URL-synced)
+// ---------------------------------------------------------------------------
+describe('TeacherDashboard filter bar', () => {
+  // Two quizzes + two groups + four assignments is enough to exercise every
+  // filter dimension without cross-pollution.
+  const QUIZ_A: QuizSummary = { ...QUIZ, id: 7, title: 'Algebra' };
+  const QUIZ_G: QuizSummary = { ...QUIZ, id: 8, title: 'Geometry' };
+  const GROUP_A: GroupOut = { id: 5, name: '10-A', student_count: 10 };
+  const GROUP_B: GroupOut = { id: 6, name: '10-B', student_count: 11 };
+
+  // One card per (quiz × group) combination — 2×2 = 4 cards total.
+  const a1: AssignmentOut = {
+    ...ASSIGNMENT,
+    id: 101,
+    quiz_id: QUIZ_A.id,
+    group_id: GROUP_A.id,
+    quiz_title: QUIZ_A.title,
+    group_name: GROUP_A.name,
+  };
+  const a2: AssignmentOut = {
+    ...ASSIGNMENT,
+    id: 102,
+    quiz_id: QUIZ_A.id,
+    group_id: GROUP_B.id,
+    quiz_title: QUIZ_A.title,
+    group_name: GROUP_B.name,
+  };
+  const a3: AssignmentOut = {
+    ...ASSIGNMENT,
+    id: 103,
+    quiz_id: QUIZ_G.id,
+    group_id: GROUP_A.id,
+    quiz_title: QUIZ_G.title,
+    group_name: GROUP_A.name,
+  };
+  const a4: AssignmentOut = {
+    ...ASSIGNMENT,
+    id: 104,
+    quiz_id: QUIZ_G.id,
+    group_id: GROUP_B.id,
+    quiz_title: QUIZ_G.title,
+    group_name: GROUP_B.name,
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+    seedAuth();
+    vi.spyOn(quizApi, 'list').mockResolvedValue({ data: [QUIZ_A, QUIZ_G] } as never);
+    vi.spyOn(groupApi, 'list').mockResolvedValue({ data: [GROUP_A, GROUP_B] } as never);
+    vi.spyOn(assignmentApi, 'list').mockResolvedValue({
+      data: [a1, a2, a3, a4],
+    } as never);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders all cards with no active filter', async () => {
+    renderDashboard('/teacher?tab=assignments');
+    expect(await screen.findAllByText('Результаты')).toHaveLength(4);
+  });
+
+  it('filters by a single quiz via the quiz popover', async () => {
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments');
+    await screen.findAllByText('Результаты');
+
+    await user.click(screen.getByRole('button', { name: /^Тесты/i }));
+    // Algebra appears twice in the DOM (filter option + the card), so limit
+    // selection to the listbox option element.
+    await user.click(await screen.findByRole('option', { name: 'Algebra' }));
+
+    await waitFor(() =>
+      expect(screen.getAllByText('Результаты')).toHaveLength(2),
+    );
+  });
+
+  it('free-text search matches quiz title', async () => {
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments');
+    await screen.findAllByText('Результаты');
+
+    const search = screen.getByPlaceholderText(/Поиск по названию/i);
+    await user.type(search, 'Geo');
+
+    await waitFor(() =>
+      expect(screen.getAllByText('Результаты')).toHaveLength(2),
+    );
+  });
+
+  it('clearing all filters restores the full list', async () => {
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments&q=Algebra');
+    await waitFor(() =>
+      expect(screen.getAllByText('Результаты')).toHaveLength(2),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Сбросить' }));
+    await waitFor(() =>
+      expect(screen.getAllByText('Результаты')).toHaveLength(4),
+    );
+  });
+
+  it('honors ?quiz=<id> deep-link on first load', async () => {
+    renderDashboard(`/teacher?tab=assignments&quiz=${QUIZ_G.id}`);
+    await waitFor(() =>
+      expect(screen.getAllByText('Результаты')).toHaveLength(2),
+    );
+  });
+
+  it('collapse-by-quiz groups cards under bucket headers', async () => {
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments');
+    await screen.findAllByText('Результаты');
+
+    await user.click(screen.getByLabelText(/Группировать по тесту/));
+
+    // Each of the two quizzes should show as a bucket heading with count "· 2".
+    await waitFor(() => {
+      expect(screen.getAllByText(/· 2/).length).toBeGreaterThanOrEqual(2);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-card extras editor (AssignmentExtraStudent CRUD via the row UI)
+// ---------------------------------------------------------------------------
+describe('TeacherDashboard AssignmentExtrasEditor', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    seedAuth();
+    vi.spyOn(quizApi, 'list').mockResolvedValue({ data: [QUIZ] } as never);
+    vi.spyOn(groupApi, 'list').mockResolvedValue({ data: [GROUP] } as never);
+    vi.spyOn(assignmentApi, 'list').mockResolvedValue({
+      data: [{ ...ASSIGNMENT, extra_student_count: 1 }],
+    } as never);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows the +N badge and lazy-loads the list on expand', async () => {
+    const listExtras = vi
+      .spyOn(assignmentApi, 'listExtras')
+      .mockResolvedValue({
+        data: [
+          {
+            id: 77,
+            display_name: 'Иванов Иван',
+            username: 'ivanov',
+            home_group_id: 6,
+            home_group_name: '10-B',
+          },
+        ],
+      } as never);
+
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments');
+    expect(await screen.findByText('+1')).toBeInTheDocument();
+    expect(listExtras).not.toHaveBeenCalled();
+
+    await user.click(
+      screen.getByRole('button', { name: /Дополнительные ученики/ }),
+    );
+    await waitFor(() => expect(listExtras).toHaveBeenCalledWith(99));
+    expect(await screen.findByText(/Иванов Иван/)).toBeInTheDocument();
+  });
+
+  it('remove chip calls removeExtra and drops the row optimistically', async () => {
+    vi.spyOn(assignmentApi, 'listExtras').mockResolvedValue({
+      data: [
+        {
+          id: 77,
+          display_name: 'Иванов Иван',
+          username: 'ivanov',
+          home_group_id: 6,
+          home_group_name: '10-B',
+        },
+      ],
+    } as never);
+    const removeExtra = vi
+      .spyOn(assignmentApi, 'removeExtra')
+      .mockResolvedValue({} as never);
+
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments');
+    await user.click(
+      await screen.findByRole('button', { name: /Дополнительные ученики/ }),
+    );
+    await screen.findByText(/Иванов Иван/);
+
+    await user.click(screen.getByRole('button', { name: /Убрать Иванов Иван/ }));
+    await waitFor(() => expect(removeExtra).toHaveBeenCalledWith(99, 77));
+    await waitFor(() =>
+      expect(screen.queryByText(/Иванов Иван/)).not.toBeInTheDocument(),
+    );
+  });
+
+  it('picker hides students already in the home group or already added', async () => {
+    vi.spyOn(assignmentApi, 'listExtras').mockResolvedValue({
+      data: [
+        {
+          id: 77,
+          display_name: 'Иванов Иван',
+          username: 'ivanov',
+          home_group_id: 6,
+          home_group_name: '10-B',
+        },
+      ],
+    } as never);
+    // Three search hits:
+    //   - 77 already-added → filtered
+    //   - 88 home-group (group_id = 5 === ASSIGNMENT.group_id) → filtered
+    //   - 99 from a different group → should show up
+    vi.spyOn(teacherApi, 'searchMyStudents').mockResolvedValue({
+      data: [
+        {
+          id: 77,
+          display_name: 'Иванов Иван',
+          username: 'ivanov',
+          group_id: 6,
+          group_name: '10-B',
+        },
+        {
+          id: 88,
+          display_name: 'Петров Пётр',
+          username: 'petrov',
+          group_id: 5,
+          group_name: '10-A',
+        },
+        {
+          id: 99,
+          display_name: 'Сидоров Сидр',
+          username: 'sidorov',
+          group_id: 7,
+          group_name: '10-C',
+        },
+      ],
+    } as never);
+
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments');
+    await user.click(
+      await screen.findByRole('button', { name: /Дополнительные ученики/ }),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: /Добавить ученика/ }),
+    );
+
+    // Sidorov should appear (different group, not added yet). Only him.
+    expect(await screen.findByText(/Сидоров/)).toBeInTheDocument();
+    expect(screen.queryByText(/Петров/)).not.toBeInTheDocument();
+    // Ivanov still appears as a CHIP (removed button) but not as a picker row —
+    // the picker row would be a <button role=menuitem>-style element, not a chip.
+    expect(screen.queryByRole('button', { name: /^Сидоров/ })).toBeInTheDocument();
+  });
+
+  it('add flow calls addExtra and refreshes the list', async () => {
+    const listExtras = vi.spyOn(assignmentApi, 'listExtras');
+    listExtras
+      .mockResolvedValueOnce({ data: [] } as never)
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 99,
+            display_name: 'Сидоров Сидр',
+            username: 'sidorov',
+            home_group_id: 7,
+            home_group_name: '10-C',
+          },
+        ],
+      } as never);
+    const addExtra = vi
+      .spyOn(assignmentApi, 'addExtra')
+      .mockResolvedValue({
+        data: {
+          id: 99,
+          display_name: 'Сидоров Сидр',
+          username: 'sidorov',
+          home_group_id: 7,
+          home_group_name: '10-C',
+        },
+      } as never);
+    vi.spyOn(teacherApi, 'searchMyStudents').mockResolvedValue({
+      data: [
+        {
+          id: 99,
+          display_name: 'Сидоров Сидр',
+          username: 'sidorov',
+          group_id: 7,
+          group_name: '10-C',
+        },
+      ],
+    } as never);
+
+    const user = userEvent.setup();
+    renderDashboard('/teacher?tab=assignments');
+    await user.click(
+      await screen.findByRole('button', { name: /Дополнительные ученики/ }),
+    );
+    await user.click(
+      await screen.findByRole('button', { name: /Добавить ученика/ }),
+    );
+    await user.click(await screen.findByRole('button', { name: /^Сидоров/ }));
+
+    await waitFor(() => expect(addExtra).toHaveBeenCalledWith(99, 99));
+    // listExtras gets called twice: once on expand, once after successful add.
+    await waitFor(() => expect(listExtras).toHaveBeenCalledTimes(2));
   });
 });

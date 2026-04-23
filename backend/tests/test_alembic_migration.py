@@ -1,8 +1,8 @@
-"""Integration test for the 0001 + 0002 + 0003 schema migrations.
+"""Integration test for the 0001 + 0002 + 0003 + 0004 schema migrations.
 
 Builds a SQLite DB with the OLD schema, seeds rows whose shape mirrors a real
 production sample, runs `alembic upgrade head` programmatically (which applies
-0001 → 0002 → 0003), and asserts both the schema and the backfilled data.
+0001 → 0002 → 0003 → 0004), and asserts both the schema and the backfilled data.
 
 Tests both directions: upgrade and downgrade.
 """
@@ -256,6 +256,55 @@ class TestZeroThreeSharedDeadlineMigration:
         assert {bool(r["shared_deadline"]) for r in rows} == {False}
 
 
+class TestZeroFourAssignmentExtrasMigration:
+    def test_creates_table_with_composite_pk(self, migration_engine: sa.Engine):
+        tables = set(sa.inspect(migration_engine).get_table_names())
+        assert "assignment_extra_students" in tables
+
+        cols = {c["name"]: c for c in sa.inspect(migration_engine).get_columns(
+            "assignment_extra_students",
+        )}
+        assert set(cols) == {"assignment_id", "student_id", "added_at"}
+        # Both sides are part of the composite primary key.
+        pk = sa.inspect(migration_engine).get_pk_constraint("assignment_extra_students")
+        assert set(pk["constrained_columns"]) == {"assignment_id", "student_id"}
+
+    def test_fks_use_on_delete_cascade(self, migration_engine: sa.Engine):
+        """PRAGMA foreign_key_list is only reliable through a freshly-opened
+        DBAPI connection — SQLAlchemy's existing pooled conn keeps returning
+        an empty list (connection-level PRAGMA cache). Opening a stdlib
+        sqlite3 connection straight to the DB file bypasses that entirely and
+        gives us the authoritative view of what SQLite will enforce."""
+        import sqlite3
+        url = str(migration_engine.url)
+        assert url.startswith("sqlite:///"), url
+        db_path = url.removeprefix("sqlite:///")
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = list(conn.execute(
+                "PRAGMA foreign_key_list('assignment_extra_students')",
+            ))
+        finally:
+            conn.close()
+
+        # Row shape: (id, seq, table, from, to, on_update, on_delete, match)
+        assert len(rows) == 2
+        by_col = {row[3]: row for row in rows}
+        assert by_col["assignment_id"][2] == "assignments"
+        assert by_col["assignment_id"][6].upper() == "CASCADE"
+        assert by_col["student_id"][2] == "students"
+        assert by_col["student_id"][6].upper() == "CASCADE"
+
+    def test_table_is_empty_after_migration(self, migration_engine: sa.Engine):
+        """Migration is additive — no row should be created from seed data."""
+        with migration_engine.connect() as conn:
+            count = conn.execute(
+                sa.text("SELECT COUNT(*) FROM assignment_extra_students"),
+            ).scalar_one()
+        assert count == 0
+
+
 class TestDowngrade:
     def test_full_downgrade_restores_columns(self, tmp_path: pathlib.Path):
         db_path = tmp_path / "alembic_down.db"
@@ -275,10 +324,12 @@ class TestDowngrade:
         command.downgrade(cfg, "base")
 
         engine = sa.create_engine(db_url)
+        tables = set(sa.inspect(engine).get_table_names())
         assignment_cols = {c["name"] for c in sa.inspect(engine).get_columns("assignments")}
         attempt_cols = {c["name"] for c in sa.inspect(engine).get_columns("attempts")}
         assert "time_limit_minutes" in assignment_cols
         assert "start_window_minutes" not in assignment_cols
         assert "shared_deadline" not in assignment_cols
         assert "deadline_at" not in attempt_cols
+        assert "assignment_extra_students" not in tables
         engine.dispose()

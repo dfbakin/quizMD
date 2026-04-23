@@ -10,12 +10,16 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Teacher, Assignment, Group, Quiz, Attempt, Answer, AssignmentStudentView
+from app.models import (
+    Teacher, Assignment, Group, Quiz, Attempt, Answer, Student,
+    AssignmentStudentView, AssignmentExtraStudent,
+)
 from app.api.deps import get_current_teacher
 from app.schemas.schemas import (
     AssignmentCreate, AssignmentUpdate, AssignmentOut,
     AssignmentResultsSummary, StudentResultRow, ShareCodeLookup,
     AttemptResult, ResultQuestionDetail, OptionOutTeacher, SavedAnswer,
+    AssignmentExtraStudentCreate, AssignmentExtraStudentOut,
 )
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -48,6 +52,22 @@ def _count_in_progress_attempts(a: Assignment, db: Session) -> int:
     )
 
 
+def _count_extra_students(a: Assignment, db: Session) -> int:
+    return (
+        db.query(AssignmentExtraStudent)
+        .filter(AssignmentExtraStudent.assignment_id == a.id)
+        .count()
+    )
+
+
+def _owns_student(teacher: Teacher, student: Student, db: Session) -> bool:
+    """True iff ``student`` lives in a group owned by ``teacher``. Used to
+    reject cross-teacher extras and cross-teacher student searches without
+    leaking which students exist server-wide."""
+    group = db.get(Group, student.group_id)
+    return group is not None and group.teacher_id == teacher.id
+
+
 def _assignment_to_out(a: Assignment, db: Session) -> AssignmentOut:
     mode = _get_student_view_mode(a)
     return AssignmentOut(
@@ -65,6 +85,7 @@ def _assignment_to_out(a: Assignment, db: Session) -> AssignmentOut:
         group_name=a.group.name,
         share_code=a.share_code,
         in_progress_attempts=_count_in_progress_attempts(a, db),
+        extra_student_count=_count_extra_students(a, db),
     )
 
 
@@ -260,6 +281,124 @@ def lookup_by_share_code(code: str, db: Session = Depends(get_db)):
         assignment_id=assignment.id,
         quiz_title=assignment.quiz.title,
     )
+
+
+# ---------------------------------------------------------------------------
+# Assignment extras: per-student access overrides
+# ---------------------------------------------------------------------------
+
+
+def _extra_to_out(student: Student, db: Session) -> AssignmentExtraStudentOut:
+    group = db.get(Group, student.group_id)
+    return AssignmentExtraStudentOut(
+        id=student.id,
+        display_name=student.display_name,
+        username=student.username,
+        home_group_id=student.group_id,
+        home_group_name=group.name if group else "",
+    )
+
+
+@router.get("/{assignment_id}/extras", response_model=list[AssignmentExtraStudentOut])
+def list_assignment_extras(
+    assignment_id: int,
+    teacher: Teacher = Depends(get_current_teacher),
+    db: Session = Depends(get_db),
+):
+    assignment = db.get(Assignment, assignment_id)
+    if assignment is None or assignment.quiz.teacher_id != teacher.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
+
+    rows = (
+        db.query(AssignmentExtraStudent)
+        .filter(AssignmentExtraStudent.assignment_id == assignment_id)
+        .order_by(AssignmentExtraStudent.added_at.asc())
+        .all()
+    )
+    # Order by added_at so the chip list stays stable as the teacher adds more
+    # (newest appears last, matching the conventional left-to-right reading).
+    out: list[AssignmentExtraStudentOut] = []
+    for row in rows:
+        student = db.get(Student, row.student_id)
+        if student is None:
+            # Cascade ON DELETE should keep these in sync, but if anything ever
+            # races in an inconsistent state we silently skip rather than 500.
+            continue
+        out.append(_extra_to_out(student, db))
+    return out
+
+
+@router.post(
+    "/{assignment_id}/extras",
+    response_model=AssignmentExtraStudentOut,
+    status_code=201,
+)
+def add_assignment_extra(
+    assignment_id: int,
+    body: AssignmentExtraStudentCreate,
+    teacher: Teacher = Depends(get_current_teacher),
+    db: Session = Depends(get_db),
+):
+    assignment = db.get(Assignment, assignment_id)
+    if assignment is None or assignment.quiz.teacher_id != teacher.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
+
+    student = db.get(Student, body.student_id)
+    if student is None or not _owns_student(teacher, student, db):
+        # 404 (not 403) so we don't reveal whether the student exists globally.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+
+    # No-op when the student already lives in the assignment's home group —
+    # adding them as an extra would be redundant and the PK would double-count
+    # (well, not actually, but it would lie to the UI badge). Treat the call
+    # as a no-op success so the UI can be idempotent.
+    if student.group_id == assignment.group_id:
+        return _extra_to_out(student, db)
+
+    existing = (
+        db.query(AssignmentExtraStudent)
+        .filter_by(assignment_id=assignment_id, student_id=student.id)
+        .first()
+    )
+    if existing is None:
+        db.add(AssignmentExtraStudent(
+            assignment_id=assignment_id,
+            student_id=student.id,
+        ))
+        db.commit()
+
+    return _extra_to_out(student, db)
+
+
+@router.delete(
+    "/{assignment_id}/extras/{student_id}",
+    status_code=204,
+)
+def remove_assignment_extra(
+    assignment_id: int,
+    student_id: int,
+    teacher: Teacher = Depends(get_current_teacher),
+    db: Session = Depends(get_db),
+):
+    assignment = db.get(Assignment, assignment_id)
+    if assignment is None or assignment.quiz.teacher_id != teacher.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
+
+    row = (
+        db.query(AssignmentExtraStudent)
+        .filter_by(assignment_id=assignment_id, student_id=student_id)
+        .first()
+    )
+    if row is None:
+        # Idempotent delete — if the teacher clicks × twice from a stale UI,
+        # the second click still returns 204. No information leak here: we
+        # already verified they own the assignment above.
+        return
+    db.delete(row)
+    db.commit()
+    # Removing the extras row only revokes future access. Any in-flight
+    # attempt keeps its snapshotted deadline_at and its existing answers —
+    # revoking visibility is not supposed to erase work the student has done.
 
 
 @router.get("/{assignment_id}/results", response_model=AssignmentResultsSummary)
