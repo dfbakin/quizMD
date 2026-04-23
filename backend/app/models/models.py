@@ -112,9 +112,24 @@ class Assignment(Base):
     quiz_id: Mapped[int] = mapped_column(ForeignKey("quizzes.id"), nullable=False)
     group_id: Mapped[int] = mapped_column(ForeignKey("groups.id"), nullable=False)
     starts_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+    # Denormalized: ends_at == starts_at + start_window_minutes. It's the
+    # *start window* close, not the per-attempt deadline.
     ends_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+    # How long after starts_at a student may begin an attempt. Decoupled from
+    # duration_minutes so a teacher can, e.g. open a 30-minute quiz for a
+    # 90-minute window and still give every student the full 30 minutes once
+    # they actually start.
+    start_window_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    # How long the attempt itself runs once started. Snapshotted into
+    # Attempt.deadline_at at start; subsequent edits do not affect attempts in
+    # flight unless the teacher chooses Reset.
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
-    time_limit_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # When True, every attempt's snapshotted deadline is anchored to
+    # ``starts_at + duration_minutes`` (a single wall-clock cutoff for the
+    # whole group) instead of ``started_at + duration_minutes``. Late starters
+    # therefore have less time on the clock — the trade-off the teacher
+    # explicitly opted into. Implies start_window_minutes == duration_minutes.
+    shared_deadline: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     results_visible: Mapped[bool] = mapped_column(Boolean, default=False)
     share_code: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
 
@@ -143,7 +158,10 @@ class Attempt(Base):
     assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"), nullable=False)
     session_token: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     shuffle_seed: Mapped[str] = mapped_column(String(100), nullable=False)
-    started_at: Mapped[dt.datetime] = mapped_column(DateTime, server_default=func.now())
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    # Snapshot deadline computed at start = started_at + assignment.duration_minutes.
+    # Immune to subsequent edits of the parent Assignment.
+    deadline_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
     submitted_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
 

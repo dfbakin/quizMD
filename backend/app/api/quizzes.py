@@ -48,7 +48,7 @@ async def import_quiz_endpoint(
     try:
         quiz = import_quiz(content, teacher.id, db)
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
     return _quiz_to_detail(quiz)
 
 
@@ -87,7 +87,7 @@ async def reimport_quiz_endpoint(
     try:
         updated = reimport_quiz(quiz_id, content, db)
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
     return _quiz_to_detail(updated)
 
 

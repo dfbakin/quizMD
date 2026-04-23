@@ -42,9 +42,10 @@ class TestAssignmentCRUD:
         assert data["quiz_title"] == "Тестовый квиз"
         assert data["group_name"] == "11А"
         assert data["duration_minutes"] == 60
-        assert data["time_limit_minutes"] == 10
         assert data["student_view_mode"] == "closed"
+        assert data["in_progress_attempts"] == 0
         assert "share_code" in data
+        assert "time_limit_minutes" not in data
 
     def test_list_assignments(self, db: Session, app_client):
         headers, quiz_id, group_id = _setup(app_client, db)
@@ -129,7 +130,11 @@ class TestAssignmentCRUD:
         assert created["starts_at"].endswith("Z")
         assert created["ends_at"].endswith("Z")
 
-    def test_change_time_limit(self, db: Session, app_client):
+    def test_change_duration_minutes(self, db: Session, app_client):
+        """Changing the per-attempt clock must NOT shift ends_at (the start
+        window close). Otherwise a teacher tightening the per-attempt timer
+        for late-joiners would silently shorten when others are allowed to
+        begin."""
         headers, quiz_id, group_id = _setup(app_client, db)
         now = dt.datetime.now(dt.timezone.utc)
         created = app_client.post("/api/assignments", json={
@@ -137,28 +142,150 @@ class TestAssignmentCRUD:
             "starts_at": (now - dt.timedelta(minutes=5)).isoformat(),
             "duration_minutes": 60,
         }, headers=headers).json()
-        assert created["time_limit_minutes"] == 10
+        original_ends_at = created["ends_at"]
+        original_window = created["start_window_minutes"]
 
         resp = app_client.patch(
             f"/api/assignments/{created['id']}",
-            json={"time_limit_minutes": 45},
+            json={"duration_minutes": 45},
             headers=headers,
         )
         assert resp.status_code == 200
-        assert resp.json()["time_limit_minutes"] == 45
+        updated = resp.json()
+        assert updated["duration_minutes"] == 45
+        # ends_at and start_window_minutes are unchanged — only the per-attempt
+        # clock was edited.
+        assert updated["ends_at"] == original_ends_at
+        assert updated["start_window_minutes"] == original_window
 
-    def test_create_with_custom_time_limit(self, db: Session, app_client):
+    def test_change_start_window_minutes_recomputes_ends_at(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": (now - dt.timedelta(minutes=5)).isoformat(),
+            "start_window_minutes": 30,
+            "duration_minutes": 60,
+        }, headers=headers).json()
+        assert created["start_window_minutes"] == 30
+        starts = _parse_utc(created["starts_at"])
+        assert _parse_utc(created["ends_at"]) == starts + dt.timedelta(minutes=30)
+
+        resp = app_client.patch(
+            f"/api/assignments/{created['id']}",
+            json={"start_window_minutes": 90},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        updated = resp.json()
+        assert updated["start_window_minutes"] == 90
+        # Only the start window changed; the per-attempt clock is unchanged.
+        assert updated["duration_minutes"] == 60
+        assert _parse_utc(updated["ends_at"]) == starts + dt.timedelta(minutes=90)
+
+    def test_create_with_explicit_start_window_distinct_from_duration(self, db: Session, app_client):
         headers, quiz_id, group_id = _setup(app_client, db)
         now = dt.datetime.now(dt.timezone.utc)
         resp = app_client.post("/api/assignments", json={
             "quiz_id": quiz_id, "group_id": group_id,
-            "starts_at": now.isoformat(), "duration_minutes": 60,
-            "time_limit_minutes": 20,
+            "starts_at": now.isoformat(),
+            "start_window_minutes": 90,
+            "duration_minutes": 30,
         }, headers=headers)
         assert resp.status_code == 201
-        assert resp.json()["time_limit_minutes"] == 20
+        data = resp.json()
+        assert data["start_window_minutes"] == 90
+        assert data["duration_minutes"] == 30
+        starts = _parse_utc(data["starts_at"])
+        assert _parse_utc(data["ends_at"]) == starts + dt.timedelta(minutes=90)
 
-    def test_change_start_time_aborts_unfinished_attempts_and_recomputes_end(self, db: Session, app_client):
+    def test_create_omitting_start_window_defaults_to_duration(self, db: Session, app_client):
+        """Backward-compatibility shim: callers that don't yet know about
+        start_window_minutes get the old conflated semantics."""
+        headers, quiz_id, group_id = _setup(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        resp = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": now.isoformat(),
+            "duration_minutes": 45,
+        }, headers=headers)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["start_window_minutes"] == 45
+        assert data["duration_minutes"] == 45
+
+    def test_create_rejects_nonpositive_start_window(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        resp = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": now.isoformat(),
+            "start_window_minutes": 0,
+            "duration_minutes": 30,
+        }, headers=headers)
+        assert resp.status_code == 422
+
+    def test_create_default_shared_deadline_is_false(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": now.isoformat(),
+            "duration_minutes": 30,
+        }, headers=headers).json()
+        assert created["shared_deadline"] is False
+
+    def test_change_start_time_with_no_open_attempts_does_not_require_choice(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": (now - dt.timedelta(minutes=1)).isoformat(),
+            "duration_minutes": 30,
+        }, headers=headers).json()
+
+        new_start = now + dt.timedelta(minutes=10)
+        patch = app_client.patch(
+            f"/api/assignments/{created['id']}",
+            json={"starts_at": new_start.isoformat()},
+            headers=headers,
+        )
+        assert patch.status_code == 200
+        updated = patch.json()
+        assert _parse_utc(updated["starts_at"]) == _parse_utc(new_start.isoformat())
+        assert _parse_utc(updated["ends_at"]) == (
+            _parse_utc(updated["starts_at"]) + dt.timedelta(minutes=updated["duration_minutes"])
+        )
+
+    def test_change_start_time_with_open_attempts_requires_explicit_choice(self, db: Session, app_client):
+        headers, quiz_id, group_id = _setup(app_client, db)
+        app_client.post(
+            f"/api/groups/{group_id}/students",
+            json={"students": [{"username": "s1", "password": "pass", "display_name": "S1"}]},
+            headers=headers,
+        )
+        s_login = app_client.post("/api/auth/login", json={"username": "s1", "password": "pass"})
+        s_headers = {"Authorization": f"Bearer {s_login.json()['access_token']}"}
+
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": (now - dt.timedelta(minutes=1)).isoformat(),
+            "duration_minutes": 30,
+        }, headers=headers).json()
+
+        app_client.post(f"/api/assignments/{created['id']}/start", headers=s_headers).json()
+
+        new_start = now + dt.timedelta(minutes=10)
+        no_choice = app_client.patch(
+            f"/api/assignments/{created['id']}",
+            json={"starts_at": new_start.isoformat()},
+            headers=headers,
+        )
+        assert no_choice.status_code == 422
+        assert "in-progress" in no_choice.json()["detail"]
+
+    def test_change_start_time_reset_deletes_open_attempts(self, db: Session, app_client):
         headers, quiz_id, group_id = _setup(app_client, db)
         app_client.post(
             f"/api/groups/{group_id}/students",
@@ -182,14 +309,11 @@ class TestAssignmentCRUD:
         new_start = now + dt.timedelta(minutes=10)
         patch = app_client.patch(
             f"/api/assignments/{created['id']}",
-            json={"starts_at": new_start.isoformat()},
+            json={"starts_at": new_start.isoformat(), "on_open_attempts": "reset"},
             headers=headers,
         )
         assert patch.status_code == 200
-        updated = patch.json()
-        assert _parse_utc(updated["starts_at"]) == _parse_utc(new_start.isoformat())
-        expected_end = _parse_utc(updated["starts_at"]) + dt.timedelta(minutes=updated["duration_minutes"])
-        assert _parse_utc(updated["ends_at"]) == expected_end
+        assert patch.json()["in_progress_attempts"] == 0
 
         save_resp = app_client.post(
             f"/api/attempts/{attempt_id}/save",
@@ -197,6 +321,50 @@ class TestAssignmentCRUD:
             headers={**s_headers, "X-Session-Token": token},
         )
         assert save_resp.status_code == 404
+
+    def test_change_start_time_keep_preserves_open_attempts_and_their_deadline(self, db: Session, app_client):
+        from app.models import Attempt
+        headers, quiz_id, group_id = _setup(app_client, db)
+        app_client.post(
+            f"/api/groups/{group_id}/students",
+            json={"students": [{"username": "s1", "password": "pass", "display_name": "S1"}]},
+            headers=headers,
+        )
+        s_login = app_client.post("/api/auth/login", json={"username": "s1", "password": "pass"})
+        s_headers = {"Authorization": f"Bearer {s_login.json()['access_token']}"}
+
+        now = dt.datetime.now(dt.timezone.utc)
+        created = app_client.post("/api/assignments", json={
+            "quiz_id": quiz_id, "group_id": group_id,
+            "starts_at": (now - dt.timedelta(minutes=1)).isoformat(),
+            "duration_minutes": 30,
+        }, headers=headers).json()
+
+        start = app_client.post(f"/api/assignments/{created['id']}/start", headers=s_headers).json()
+        attempt_id = start["attempt_id"]
+        token = start["session_token"]
+        original_deadline = _parse_utc(start["deadline_at"])
+
+        new_start = now + dt.timedelta(minutes=10)
+        patch = app_client.patch(
+            f"/api/assignments/{created['id']}",
+            json={"starts_at": new_start.isoformat(), "on_open_attempts": "keep"},
+            headers=headers,
+        )
+        assert patch.status_code == 200
+        assert patch.json()["in_progress_attempts"] == 1
+
+        # The attempt is still active and saving still works against its snapshot deadline.
+        save_resp = app_client.post(
+            f"/api/attempts/{attempt_id}/save",
+            json={"answers": []},
+            headers={**s_headers, "X-Session-Token": token},
+        )
+        assert save_resp.status_code == 200
+
+        att = db.get(Attempt, attempt_id)
+        assert att is not None
+        assert att.deadline_at.replace(tzinfo=None) == original_deadline.replace(tzinfo=None)
 
     def test_export_results_csv(self, db: Session, app_client):
         headers, quiz_id, group_id = _setup(app_client, db)

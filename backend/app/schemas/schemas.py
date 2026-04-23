@@ -144,16 +144,33 @@ class AssignmentCreate(BaseModel):
     quiz_id: int
     group_id: int
     starts_at: dt.datetime
+    # How long after starts_at a student may begin an attempt. When omitted,
+    # the server defaults it to ``duration_minutes`` — same semantics as
+    # before the start window was decoupled from the attempt clock.
+    # Ignored (forced equal to duration_minutes) when shared_deadline=True.
+    start_window_minutes: int | None = None
+    # How long the attempt itself runs once started.
     duration_minutes: int
-    time_limit_minutes: int | None = None
+    # When True, every attempt's deadline is anchored to ``starts_at + duration``
+    # (single shared cutoff), instead of ``started_at + duration``. Late
+    # starters therefore have less time on the clock.
+    shared_deadline: bool = False
+
+
+# When PATCHing starts_at on an assignment with active in-progress attempts, the teacher
+# must explicitly choose how to handle them: "reset" runs the existing cascade-delete
+# ("restart the quiz" workflow); "keep" leaves them with their snapshot deadline intact.
+OnOpenAttempts = Literal["reset", "keep"]
 
 
 class AssignmentUpdate(BaseModel):
     results_visible: bool | None = None
     student_view_mode: StudentViewMode | None = None
     starts_at: dt.datetime | None = None
+    start_window_minutes: int | None = None
     duration_minutes: int | None = None
-    time_limit_minutes: int | None = None
+    shared_deadline: bool | None = None
+    on_open_attempts: OnOpenAttempts | None = None
 
 
 class AssignmentOut(BaseSchema):
@@ -161,14 +178,17 @@ class AssignmentOut(BaseSchema):
     quiz_id: int
     group_id: int
     starts_at: UTCDatetime
+    # ends_at == starts_at + start_window_minutes (denormalized).
     ends_at: UTCDatetime
+    start_window_minutes: int
     duration_minutes: int
-    time_limit_minutes: int | None
+    shared_deadline: bool = False
     results_visible: bool
     student_view_mode: StudentViewMode = "closed"
     quiz_title: str
     group_name: str
     share_code: str
+    in_progress_attempts: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -187,11 +207,28 @@ class AttemptStart(BaseSchema):
     attempt_id: int
     session_token: str
     questions: list[QuestionOut]
-    time_limit_minutes: int | None
+    duration_minutes: int
     started_at: UTCDatetime
     deadline_at: UTCDatetime
     server_now: UTCDatetime
     saved_answers: list[SavedAnswer]
+
+
+class HeartbeatRequest(BaseModel):
+    """
+    Optional payload for /attempts/:id/heartbeat. When `answers` is omitted the
+    heartbeat is purely a timer re-anchor; when provided, answers are upserted
+    (same shape as /save) so a single round-trip handles both.
+    """
+    answers: list[SavedAnswer] | None = None
+
+
+class HeartbeatResponse(BaseSchema):
+    server_now: UTCDatetime
+    deadline_at: UTCDatetime
+    status: Literal["in_progress", "submitted", "expired"]
+    expired: bool
+    score: float | None = None
 
 
 class AnswerSave(BaseModel):
@@ -255,11 +292,18 @@ class StudentAssignmentOut(BaseSchema):
     assignment_id: int
     quiz_title: str
     starts_at: UTCDatetime
+    # ends_at == starts_at + start_window_minutes — i.e. when the *Start*
+    # button stops being clickable. Once an attempt is in progress, the
+    # per-attempt deadline (`attempt_deadline_at`) takes over.
     ends_at: UTCDatetime
+    start_window_minutes: int
     duration_minutes: int
-    time_limit_minutes: int | None
+    # Surfaced so the dashboard can label the deadline differently in shared
+    # mode (where ends_at is also the per-attempt cutoff for everyone).
+    shared_deadline: bool = False
     status: str
     attempt_id: int | None = None
+    attempt_deadline_at: UTCDatetime | None = None
     results_visible: bool = False
     student_view_mode: StudentViewMode = "closed"
 

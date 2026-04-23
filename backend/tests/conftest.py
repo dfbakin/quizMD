@@ -138,18 +138,22 @@ def create_test_assignment(
     group_id: int,
     starts_at: dt.datetime | None = None,
     duration_minutes: int = 60,
-    time_limit_minutes: int | None = 10,
+    start_window_minutes: int | None = None,
 ) -> Assignment:
+    """Helper used across the test suite. ``start_window_minutes`` defaults to
+    ``duration_minutes`` so existing callers preserve their pre-decoupling
+    behavior with no changes."""
     import secrets
     now = dt.datetime.now(dt.timezone.utc)
     start = starts_at or now - dt.timedelta(minutes=5)
+    window = start_window_minutes if start_window_minutes is not None else duration_minutes
     assignment = Assignment(
         quiz_id=quiz_id,
         group_id=group_id,
         starts_at=start,
-        ends_at=start + dt.timedelta(minutes=duration_minutes),
+        ends_at=start + dt.timedelta(minutes=window),
+        start_window_minutes=window,
         duration_minutes=duration_minutes,
-        time_limit_minutes=time_limit_minutes,
         results_visible=False,
         share_code=secrets.token_urlsafe(6),
     )

@@ -40,7 +40,15 @@ def _set_student_view_mode(a: Assignment, db: Session, mode: str) -> None:
     a.results_visible = mode == "results"
 
 
-def _assignment_to_out(a: Assignment) -> AssignmentOut:
+def _count_in_progress_attempts(a: Assignment, db: Session) -> int:
+    return (
+        db.query(Attempt)
+        .filter(Attempt.assignment_id == a.id, Attempt.submitted_at.is_(None))
+        .count()
+    )
+
+
+def _assignment_to_out(a: Assignment, db: Session) -> AssignmentOut:
     mode = _get_student_view_mode(a)
     return AssignmentOut(
         id=a.id,
@@ -48,13 +56,15 @@ def _assignment_to_out(a: Assignment) -> AssignmentOut:
         group_id=a.group_id,
         starts_at=a.starts_at,
         ends_at=a.ends_at,
+        start_window_minutes=a.start_window_minutes,
         duration_minutes=a.duration_minutes,
-        time_limit_minutes=a.time_limit_minutes,
+        shared_deadline=a.shared_deadline,
         results_visible=mode == "results",
         student_view_mode=mode,
         quiz_title=a.quiz.title,
         group_name=a.group.name,
         share_code=a.share_code,
+        in_progress_attempts=_count_in_progress_attempts(a, db),
     )
 
 
@@ -78,22 +88,44 @@ def create_assignment(
     if group is None or group.teacher_id != teacher.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
 
-    starts = body.starts_at.replace(tzinfo=None) if body.starts_at.tzinfo else body.starts_at
-    ends = starts + dt.timedelta(minutes=body.duration_minutes)
-
-    tlm = body.time_limit_minutes if body.time_limit_minutes is not None else quiz.time_limit_minutes
-    if not tlm or tlm <= 0:
+    if body.duration_minutes <= 0:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "Time limit is required (set in quiz file or assignment form)",
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "duration_minutes must be positive",
         )
+
+    if body.shared_deadline:
+        # Shared-deadline mode pins the start window to the attempt clock —
+        # allowing a start later than the shared deadline would be incoherent.
+        # Any caller-supplied value is silently overridden so the invariant
+        # always holds, mirroring how the UI hides the field in this mode.
+        start_window = body.duration_minutes
+    else:
+        # Default the start window to the attempt clock for backward compatibility:
+        # the same one-knob semantics callers used before the split.
+        start_window = (
+            body.start_window_minutes
+            if body.start_window_minutes is not None
+            else body.duration_minutes
+        )
+    if start_window <= 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "start_window_minutes must be positive",
+        )
+
+    starts = body.starts_at.replace(tzinfo=None) if body.starts_at.tzinfo else body.starts_at
+    # ends_at is the close of the *start window*, NOT the per-attempt deadline.
+    ends = starts + dt.timedelta(minutes=start_window)
+
     assignment = Assignment(
         quiz_id=body.quiz_id,
         group_id=body.group_id,
         starts_at=starts,
         ends_at=ends,
+        start_window_minutes=start_window,
         duration_minutes=body.duration_minutes,
-        time_limit_minutes=tlm,
+        shared_deadline=body.shared_deadline,
         share_code=secrets.token_urlsafe(6),
     )
     db.add(assignment)
@@ -101,7 +133,7 @@ def create_assignment(
     db.add(AssignmentStudentView(assignment_id=assignment.id, student_view_mode="closed"))
     db.commit()
     db.refresh(assignment)
-    return _assignment_to_out(assignment)
+    return _assignment_to_out(assignment, db)
 
 
 @router.get("", response_model=list[AssignmentOut])
@@ -116,7 +148,7 @@ def list_assignments(
         .order_by(Assignment.starts_at.desc(), Assignment.id.desc())
         .all()
     )
-    return [_assignment_to_out(a) for a in assignments]
+    return [_assignment_to_out(a, db) for a in assignments]
 
 
 @router.patch("/{assignment_id}", response_model=AssignmentOut)
@@ -130,37 +162,80 @@ def update_assignment(
     if assignment is None or assignment.quiz.teacher_id != teacher.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assignment not found")
 
-    starts_at_changed = False
     if body.student_view_mode is not None:
         _set_student_view_mode(assignment, db, body.student_view_mode)
     elif body.results_visible is not None:
         _set_student_view_mode(assignment, db, "results" if body.results_visible else "closed")
+
+    starts_at_changed = False
     if body.starts_at is not None:
         new_starts = body.starts_at.replace(tzinfo=None) if body.starts_at.tzinfo else body.starts_at
         starts_at_changed = new_starts != assignment.starts_at
         assignment.starts_at = new_starts
+
+    if body.start_window_minutes is not None:
+        if body.start_window_minutes <= 0:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "start_window_minutes must be positive",
+            )
+        assignment.start_window_minutes = body.start_window_minutes
+
     if body.duration_minutes is not None:
+        if body.duration_minutes <= 0:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "duration_minutes must be positive",
+            )
         assignment.duration_minutes = body.duration_minutes
-        assignment.ends_at = assignment.starts_at + dt.timedelta(minutes=assignment.duration_minutes)
-    elif starts_at_changed:
-        # Keep schedule consistency when starts_at changes by itself.
-        assignment.ends_at = assignment.starts_at + dt.timedelta(minutes=assignment.duration_minutes)
-    if body.time_limit_minutes is not None:
-        assignment.time_limit_minutes = body.time_limit_minutes
+
+    if body.shared_deadline is not None:
+        assignment.shared_deadline = body.shared_deadline
+
+    # Shared mode invariant: start_window_minutes must equal duration_minutes
+    # so the Start button can never remain available past the shared deadline.
+    # We re-pin it whenever the assignment is in shared mode, regardless of
+    # which knob this PATCH touched.
+    shared_pin_changed = False
+    if assignment.shared_deadline and (
+        assignment.start_window_minutes != assignment.duration_minutes
+    ):
+        assignment.start_window_minutes = assignment.duration_minutes
+        shared_pin_changed = True
+
+    # ends_at is the start-window close. Recompute when anything that feeds it
+    # changed: starts_at, start_window_minutes (explicitly or via the shared
+    # pin above).
+    if starts_at_changed or body.start_window_minutes is not None or shared_pin_changed:
+        assignment.ends_at = assignment.starts_at + dt.timedelta(
+            minutes=assignment.start_window_minutes
+        )
 
     if starts_at_changed:
-        # Teacher explicitly requested that changing starts_at aborts open attempts.
-        unfinished_attempts = (
+        unfinished = (
             db.query(Attempt)
             .filter(Attempt.assignment_id == assignment.id, Attempt.submitted_at.is_(None))
             .all()
         )
-        for att in unfinished_attempts:
-            db.delete(att)
+        if unfinished:
+            choice = body.on_open_attempts
+            if choice is None:
+                # The frontend must explicitly pick a side when in-progress attempts exist.
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    f"Assignment has {len(unfinished)} in-progress attempt(s); "
+                    "pass on_open_attempts='reset' to delete them or 'keep' to preserve them.",
+                )
+            if choice == "reset":
+                # Existing intentional behavior: 'restart the quiz' workflow.
+                for att in unfinished:
+                    db.delete(att)
+            # 'keep' is intentionally a no-op: in-progress attempts retain their
+            # snapshot deadline_at, which is independent of starts_at.
 
     db.commit()
     db.refresh(assignment)
-    return _assignment_to_out(assignment)
+    return _assignment_to_out(assignment, db)
 
 
 @router.delete("/{assignment_id}", status_code=204)

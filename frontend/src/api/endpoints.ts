@@ -3,6 +3,7 @@ import type {
   TokenResponse, QuizSummary, QuizDetail, GroupOut, StudentOut,
   AssignmentOut, StudentAssignment, AttemptStart, AnswerSave,
   AttemptResult, AssignmentResultsSummary, ShareCodeLookup, StudentViewMode,
+  HeartbeatResponse,
 } from '../types/quiz';
 
 export const authApi = {
@@ -39,13 +40,36 @@ export const groupApi = {
   removeStudent: (gid: number, sid: number) => api.delete(`/groups/${gid}/students/${sid}`),
 };
 
+export type OnOpenAttempts = 'reset' | 'keep';
+
 export const assignmentApi = {
   list: () => api.get<AssignmentOut[]>('/assignments'),
-  create: (data: { quiz_id: number; group_id: number; starts_at: string; duration_minutes: number; time_limit_minutes?: number }) =>
+  create: (data: {
+    quiz_id: number;
+    group_id: number;
+    starts_at: string;
+    // Optional: server defaults it to duration_minutes when omitted, matching
+    // the pre-decoupling behavior. Ignored (forced equal to duration) when
+    // shared_deadline=true.
+    start_window_minutes?: number;
+    duration_minutes: number;
+    shared_deadline?: boolean;
+  }) =>
     api.post<AssignmentOut>('/assignments', data),
   lookupByCode: (code: string) =>
     api.get<ShareCodeLookup>(`/assignments/by-code/${code}`),
-  update: (id: number, data: { results_visible?: boolean; student_view_mode?: StudentViewMode; starts_at?: string; duration_minutes?: number; time_limit_minutes?: number }) =>
+  update: (
+    id: number,
+    data: {
+      results_visible?: boolean;
+      student_view_mode?: StudentViewMode;
+      starts_at?: string;
+      start_window_minutes?: number;
+      duration_minutes?: number;
+      shared_deadline?: boolean;
+      on_open_attempts?: OnOpenAttempts;
+    },
+  ) =>
     api.patch<AssignmentOut>(`/assignments/${id}`, data),
   remove: (id: number) => api.delete(`/assignments/${id}`),
   results: (id: number) => api.get<AssignmentResultsSummary>(`/assignments/${id}/results`),
@@ -61,6 +85,12 @@ export const studentApi = {
     api.post<AttemptStart>(`/assignments/${assignmentId}/start`),
   saveAnswers: (attemptId: number, answers: AnswerSave[], sessionToken: string) =>
     api.post(`/attempts/${attemptId}/save`, { answers }, { headers: { 'X-Session-Token': sessionToken } }),
+  heartbeat: (attemptId: number, sessionToken: string, answers?: AnswerSave[]) =>
+    api.post<HeartbeatResponse>(
+      `/attempts/${attemptId}/heartbeat`,
+      answers !== undefined ? { answers } : {},
+      { headers: { 'X-Session-Token': sessionToken } },
+    ),
   submitAttempt: (attemptId: number, answers: AnswerSave[], sessionToken: string) =>
     api.post(`/attempts/${attemptId}/submit`, { answers }, { headers: { 'X-Session-Token': sessionToken } }),
   getResults: (attemptId: number) =>

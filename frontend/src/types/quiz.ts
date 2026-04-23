@@ -67,25 +67,41 @@ export interface AssignmentOut {
   quiz_id: number;
   group_id: number;
   starts_at: string;
+  // ends_at == starts_at + start_window_minutes (start-window close, NOT
+  // the per-attempt deadline). When shared_deadline=true it also coincides
+  // with each attempt's deadline.
   ends_at: string;
+  start_window_minutes: number;
   duration_minutes: number;
-  time_limit_minutes: number | null;
+  // When true, every attempt's deadline is anchored to ends_at instead of
+  // started_at + duration_minutes — i.e. one wall-clock cutoff for the
+  // whole group; late starters get less time on the clock.
+  shared_deadline: boolean;
   results_visible: boolean;
   student_view_mode: StudentViewMode;
   quiz_title: string;
   group_name: string;
   share_code: string;
+  in_progress_attempts: number;
 }
+
+export type StudentAssignmentStatus = 'upcoming' | 'active' | 'completed';
 
 export interface StudentAssignment {
   assignment_id: number;
   quiz_title: string;
   starts_at: string;
+  // ends_at is the start-window close. In shared-deadline mode it doubles
+  // as the deadline for every attempt of this assignment.
   ends_at: string;
+  start_window_minutes: number;
   duration_minutes: number;
-  time_limit_minutes: number | null;
-  status: 'upcoming' | 'active' | 'completed';
+  // Surfaced so the dashboard can label the deadline differently in shared
+  // mode (where ends_at is the per-attempt cutoff for everyone).
+  shared_deadline: boolean;
+  status: StudentAssignmentStatus;
   attempt_id: number | null;
+  attempt_deadline_at: string | null;
   results_visible: boolean;
   student_view_mode: StudentViewMode;
 }
@@ -105,7 +121,7 @@ export interface AttemptStart {
   attempt_id: number;
   session_token: string;
   questions: Question[];
-  time_limit_minutes: number | null;
+  duration_minutes: number;
   started_at: string;
   deadline_at: string;
   server_now: string;
@@ -116,6 +132,16 @@ export interface AnswerSave {
   question_id: number;
   selected_option_ids?: number[] | null;
   text_answer?: string | null;
+}
+
+export type AttemptStatus = 'in_progress' | 'submitted' | 'expired';
+
+export interface HeartbeatResponse {
+  server_now: string;
+  deadline_at: string;
+  status: AttemptStatus;
+  expired: boolean;
+  score: number | null;
 }
 
 export interface ResultQuestionDetail {

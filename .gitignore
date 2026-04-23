@@ -33,6 +33,9 @@ Thumbs.db
 # Docker volumes
 pgdata/
 
+# Live DB backups (pg_dump artifacts pulled from prod) — NEVER commit
+local_backups/
+
 # pytest / coverage
 .pytest_cache/
 .coverage

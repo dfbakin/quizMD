@@ -81,7 +81,7 @@ export default function AssignmentResults() {
               {exporting ? 'Экспорт...' : 'Экспорт CSV'}
             </button>
             <ThemeToggle />
-            <button onClick={() => navigate('/teacher')} className="text-sm text-gray-500 dark:text-gray-400 hover:text-blue-600 transition">Назад</button>
+            <button onClick={() => navigate(-1)} className="text-sm text-gray-500 dark:text-gray-400 hover:text-blue-600 transition">Назад</button>
           </div>
         </div>
       </header>

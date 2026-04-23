@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { studentApi } from '../api/endpoints';
 import type { StudentAssignment } from '../types/quiz';
 import { useAuth } from '../hooks/useAuth';
@@ -10,7 +10,6 @@ export default function StudentDashboard() {
   const [assignments, setAssignments] = useState<StudentAssignment[]>([]);
   const [loading, setLoading] = useState(true);
   const { user, logout } = useAuth();
-  const navigate = useNavigate();
 
   useEffect(() => {
     studentApi.myAssignments().then((r) => { setAssignments(r.data); setLoading(false); });
@@ -55,29 +54,50 @@ export default function StudentDashboard() {
                       <LatexText text={a.quiz_title} className="inline" />
                     </h2>
                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                      {a.time_limit_minutes ? `${a.time_limit_minutes} мин` : 'Без ограничения'}{' · '}
-                      до {new Date(a.ends_at).toLocaleString('ru')}
+                      Доступен с {new Date(a.starts_at).toLocaleString('ru')}
                     </p>
+                    {a.shared_deadline ? (
+                      <>
+                        <p className="text-sm text-gray-500 dark:text-gray-400">
+                          Длительность теста: {a.duration_minutes} мин
+                        </p>
+                        <p
+                          className="text-sm text-gray-500 dark:text-gray-400"
+                          title="Все ученики этой группы заканчивают в одно и то же время. Кто начал позже — успеет меньше."
+                        >
+                          Дедлайн для всех: {new Date(a.ends_at).toLocaleString('ru')}
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-sm text-gray-500 dark:text-gray-400">
+                          {`Длительность попытки: ${a.duration_minutes} мин`}
+                        </p>
+                        <p className="text-sm text-gray-500 dark:text-gray-400">
+                          Можно начать до {new Date(a.ends_at).toLocaleString('ru')}
+                        </p>
+                      </>
+                    )}
                     <span className={`inline-block mt-2 text-xs font-medium px-2.5 py-0.5 rounded-full ${st.color}`}>
                       {st.text}
                     </span>
                   </div>
                   <div className="flex gap-2">
                     {a.status === 'active' && (
-                      <button
-                        onClick={() => navigate(`/student/quiz/${a.assignment_id}`)}
+                      <Link
+                        to={`/student/quiz/${a.assignment_id}`}
                         className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600 transition"
                       >
                         {a.attempt_id ? 'Продолжить' : 'Начать'}
-                      </button>
+                      </Link>
                     )}
                     {a.status === 'completed' && a.attempt_id && a.student_view_mode !== 'closed' && (
-                      <button
-                        onClick={() => navigate(`/student/results/${a.attempt_id}`)}
+                      <Link
+                        to={`/student/results/${a.attempt_id}`}
                         className="bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 transition"
                       >
                         {a.student_view_mode === 'attempt' ? 'Попытка' : 'Результаты'}
-                      </button>
+                      </Link>
                     )}
                   </div>
                 </div>

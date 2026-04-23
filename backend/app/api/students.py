@@ -25,6 +25,8 @@ from app.schemas.schemas import (
     AttemptResult,
     ResultQuestionDetail,
     OptionOutTeacher,
+    HeartbeatRequest,
+    HeartbeatResponse,
 )
 
 router = APIRouter(tags=["student"])
@@ -43,22 +45,21 @@ def _ensure_naive(d: dt.datetime) -> dt.datetime:
     return d.replace(tzinfo=None) if d.tzinfo else d
 
 
-def _assignment_time_limit_minutes(assignment: Assignment) -> int | None:
-    return assignment.time_limit_minutes or assignment.quiz.time_limit_minutes
-
-
 def _attempt_deadline(attempt: Attempt) -> dt.datetime:
-    """Hybrid rule: min(attempt started + time limit, assignment end)."""
-    assignment_end = _ensure_naive(attempt.assignment.ends_at)
-    tlm = _assignment_time_limit_minutes(attempt.assignment)
-    if tlm and tlm > 0:
-        by_attempt_limit = _ensure_naive(attempt.started_at) + dt.timedelta(minutes=tlm)
-        return min(by_attempt_limit, assignment_end)
-    return assignment_end
+    """The per-attempt deadline is snapshotted at start. Read it directly."""
+    return _ensure_naive(attempt.deadline_at)
 
 
 def _is_attempt_expired(attempt: Attempt, now: dt.datetime) -> bool:
     return now > _attempt_deadline(attempt)
+
+
+def _attempt_status(attempt: Attempt, now: dt.datetime) -> str:
+    if attempt.submitted_at is not None:
+        return "submitted"
+    if _is_attempt_expired(attempt, now):
+        return "expired"
+    return "in_progress"
 
 
 def _student_view_mode(assignment: Assignment) -> str:
@@ -140,7 +141,6 @@ def list_my_assignments(
             .all()
         )
         attempt = _pick_primary_attempt(attempts) if attempts else None
-        tlm = _assignment_time_limit_minutes(a)
         attempt_expired = False
         if attempt and not attempt.submitted_at:
             attempt_expired = _is_attempt_expired(attempt, now)
@@ -152,6 +152,7 @@ def list_my_assignments(
         elif attempt_expired:
             s = "completed"
         elif now > _ensure_naive(a.ends_at):
+            # Start window closed; if no attempt was ever started the assignment is over.
             s = "completed"
         else:
             s = "active"
@@ -161,10 +162,12 @@ def list_my_assignments(
             quiz_title=a.quiz.title,
             starts_at=a.starts_at,
             ends_at=a.ends_at,
+            start_window_minutes=a.start_window_minutes,
             duration_minutes=a.duration_minutes,
-            time_limit_minutes=tlm,
+            shared_deadline=a.shared_deadline,
             status=s,
             attempt_id=attempt.id if attempt else None,
+            attempt_deadline_at=attempt.deadline_at if attempt else None,
             results_visible=_student_view_mode(a) == "results",
             student_view_mode=_student_view_mode(a),
         ))
@@ -184,6 +187,9 @@ def start_attempt(
     now = _utcnow()
     if now < _ensure_naive(assignment.starts_at):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Quiz has not started yet")
+    # ends_at == starts_at + start_window_minutes is the close of the *start*
+    # window. Once an attempt has begun, only its own snapshot deadline_at
+    # matters; ends_at no longer applies.
     if now > _ensure_naive(assignment.ends_at):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Quiz deadline has passed")
 
@@ -197,8 +203,6 @@ def start_attempt(
         )
         if existing and existing.submitted_at:
             raise HTTPException(status.HTTP_409_CONFLICT, "Already submitted")
-
-        tlm = _assignment_time_limit_minutes(assignment)
 
         if existing:
             if _is_attempt_expired(existing, now):
@@ -223,7 +227,7 @@ def start_attempt(
                 attempt_id=existing.id,
                 session_token=new_token,
                 questions=questions,
-                time_limit_minutes=tlm,
+                duration_minutes=assignment.duration_minutes,
                 started_at=existing.started_at,
                 deadline_at=_attempt_deadline(existing),
                 server_now=now,
@@ -232,11 +236,25 @@ def start_attempt(
 
         session_token = uuid.uuid4().hex
         shuffle_seed = uuid.uuid4().hex
+        # Snapshot deadline at creation time so subsequent edits to the parent
+        # Assignment cannot move it.
+        #   shared_deadline=True  → anchor to starts_at (every attempt of this
+        #                           assignment ends at the same wall-clock).
+        #   shared_deadline=False → anchor to started_at (each student gets the
+        #                           full per-attempt clock from when they began).
+        anchor = (
+            _ensure_naive(assignment.starts_at)
+            if assignment.shared_deadline
+            else now
+        )
+        deadline = anchor + dt.timedelta(minutes=assignment.duration_minutes)
         attempt = Attempt(
             student_id=student.id,
             assignment_id=assignment_id,
             session_token=session_token,
             shuffle_seed=shuffle_seed,
+            started_at=now,
+            deadline_at=deadline,
         )
         db.add(attempt)
         db.commit()
@@ -247,7 +265,7 @@ def start_attempt(
             attempt_id=attempt.id,
             session_token=session_token,
             questions=questions,
-            time_limit_minutes=tlm,
+            duration_minutes=assignment.duration_minutes,
             started_at=attempt.started_at,
             deadline_at=_attempt_deadline(attempt),
             server_now=now,
@@ -340,6 +358,61 @@ def save_answers(
 
     _upsert_answers(attempt, body.answers, db, grade=False)
     return {"status": "saved"}
+
+
+@router.post("/api/attempts/{attempt_id}/heartbeat", response_model=HeartbeatResponse)
+def heartbeat_attempt(
+    attempt_id: int,
+    body: HeartbeatRequest,
+    student: Student = Depends(get_current_student),
+    db: Session = Depends(get_db),
+    x_session_token: str | None = Header(None),
+):
+    """Re-anchor the client clock + optionally upsert answers in one round-trip.
+
+    Called every ~30s and on visibility/online events. Server is the only
+    authority for `deadline_at`; if the attempt has already expired this auto-
+    grades it and reports back. The client must not extend its local timer
+    based on anything other than the (server_now, deadline_at) pair returned
+    here.
+    """
+    attempt = db.get(Attempt, attempt_id)
+    if attempt is None or attempt.student_id != student.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Attempt not found")
+    _verify_session_token(attempt, x_session_token)
+
+    now = _utcnow()
+
+    if attempt.submitted_at is not None:
+        return HeartbeatResponse(
+            server_now=now,
+            deadline_at=_attempt_deadline(attempt),
+            status="submitted",
+            expired=False,
+            score=attempt.score,
+        )
+
+    if _is_attempt_expired(attempt, now):
+        _auto_grade_expired(attempt, db, now=now)
+        db.refresh(attempt)
+        return HeartbeatResponse(
+            server_now=now,
+            deadline_at=_attempt_deadline(attempt),
+            status="expired",
+            expired=True,
+            score=attempt.score,
+        )
+
+    if body.answers is not None:
+        _upsert_answers(attempt, body.answers, db, grade=False)
+
+    return HeartbeatResponse(
+        server_now=now,
+        deadline_at=_attempt_deadline(attempt),
+        status="in_progress",
+        expired=False,
+        score=None,
+    )
 
 
 @router.post("/api/attempts/{attempt_id}/submit", status_code=200)

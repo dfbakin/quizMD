@@ -83,11 +83,13 @@ def main():
         import secrets
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         duration = 24 * 60
+        start_window = 24 * 60
         assignment = Assignment(
             quiz_id=quiz.id,
             group_id=group_a.id,
             starts_at=now - dt.timedelta(minutes=5),
-            ends_at=now - dt.timedelta(minutes=5) + dt.timedelta(minutes=duration),
+            ends_at=now - dt.timedelta(minutes=5) + dt.timedelta(minutes=start_window),
+            start_window_minutes=start_window,
             duration_minutes=duration,
             results_visible=False,
             share_code=secrets.token_urlsafe(6),
